@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "SM Live",
+    "slug": "sm-live",
+    "version": "0.1.0",
+    "scheme": "smlive",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "backgroundColor": "#0f172a",
+    "ios": { "bundleIdentifier": "com.smlive.app", "infoPlist": { "NSCameraUsageDescription": "Camera for live streaming", "NSMicrophoneUsageDescription": "Microphone for voice rooms" } },
+    "android": { "package": "com.smlive.app", "permissions": ["android.permission.CAMERA", "android.permission.RECORD_AUDIO", "android.permission.INTERNET"] },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "@config-plugins/react-native-webrtc"
+    ],
+    "experiments": { "typedRoutes": true }
+  }
+}
