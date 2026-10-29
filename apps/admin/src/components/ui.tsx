@@ -14,8 +14,9 @@ export function Card({ title, children, actions }: { title?: string; children: R
   );
 }
 
-export function Button({ children, onClick, variant = "primary", disabled, title }: {
+export function Button({ children, onClick, variant = "primary", disabled, title, type = "button" }: {
   children: React.ReactNode; onClick?: () => void; variant?: "primary" | "ghost" | "danger" | "subtle"; disabled?: boolean; title?: string;
+  type?: "button" | "submit" | "reset";
 }) {
   const styles = {
     primary: "bg-violet-600 hover:bg-violet-700 text-white",
@@ -24,7 +25,7 @@ export function Button({ children, onClick, variant = "primary", disabled, title
     subtle: "bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-800 dark:text-slate-200",
   }[variant];
   return (
-    <button title={title} disabled={disabled} onClick={onClick}
+    <button type={type} title={title} disabled={disabled} onClick={onClick}
       className={`px-3 py-1.5 rounded-lg text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed ${styles}`}>
       {children}
     </button>

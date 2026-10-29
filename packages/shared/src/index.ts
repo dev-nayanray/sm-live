@@ -223,6 +223,63 @@ export const playerRestrictionSchema = z.object({
   expiresAt: z.coerce.date().nullable().optional(),
 });
 
+/**
+ * Admin notes — internal records attached to a user, never exposed to the
+ * mobile app. Used by Super Admins for moderation context, review history,
+ * and internal hand-off notes between shifts.
+ *
+ * `category` is a controlled enum so the admin UI can filter/group notes
+ * without free-text drift.
+ */
+export const ADMIN_NOTE_CATEGORIES = ["general", "review", "moderation", "escalation", "financial", "other"] as const;
+export type AdminNoteCategory = (typeof ADMIN_NOTE_CATEGORIES)[number];
+
+export const adminNoteSchema = z.object({
+  userId: z.coerce.number().int().positive(),
+  category: z.enum(ADMIN_NOTE_CATEGORIES),
+  body: z.string().trim().min(1).max(2000),
+  internal: z.boolean().default(true),
+});
+
+/**
+ * Profile-edit schema. Excludes password/phone/email — those go through the
+ * auth flows (registration, OTP, password reset) and must NOT be edited from
+ * the admin panel directly.
+ */
+export const userUpdateSchema = z.object({
+  displayName: z.string().trim().min(2).max(40).optional(),
+  country: z.string().trim().length(2).optional(),
+  agencyId: z.coerce.number().int().positive().nullable().optional(),
+  vipLevel: z.coerce.number().int().min(0).max(100).optional(),
+  nobleLevel: z.coerce.number().int().min(0).max(100).optional(),
+  avatarUrl: z.string().trim().max(500).optional(),
+});
+
+/**
+ * User-list filter schema. All filters are optional and validated server-side
+ * so the API never accepts an unbounded or malformed query.
+ */
+export const userListQuerySchema = paginationQuery.extend({
+  status: z.enum(["active", "restricted", "banned", "muted", "frozen"]).optional(),
+  country: z.string().trim().length(2).optional(),
+  agencyId: z.coerce.number().int().positive().optional(),
+  registeredFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  registeredTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  hasRestriction: z.enum(["true", "false"]).optional(),
+});
+export type UserListQuery = z.infer<typeof userListQuerySchema>;
+
+/**
+ * Mask a phone or email for display to administrators who lack the
+ * `players.read` permission (which we treat as the "view sensitive contact"
+ * permission gate). e.g. "+880170000001" → "+87***01".
+ */
+export function maskContact(s: string | null | undefined): string | null {
+  if (!s) return null;
+  if (s.length <= 4) return "****";
+  return s.slice(0, 2) + "***" + s.slice(-2);
+}
+
 // --- Public app config (response of GET /v1/config/app) ---
 export interface AppConfigGift { id: number; name: string; iconUrl: string; price: number; category: string; animation: string; }
 export interface AppConfigGame { code: string; name: string; thumbnailUrl: string; isPro: boolean; status: string; minBet: number; maxBet: number; }

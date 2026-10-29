@@ -1,7 +1,11 @@
 import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { adminLoginSchema, paginationQuery, LEDGER_KINDS } from "@sm-live/shared";
+import {
+  adminLoginSchema, paginationQuery, LEDGER_KINDS,
+  userListQuerySchema, userUpdateSchema, adminNoteSchema,
+  maskContact, RESTRICTION_TYPES,
+} from "@sm-live/shared";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { unauthorized, notFound, badRequest, forbidden } from "../../lib/errors.js";
@@ -508,29 +512,543 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // --- Users ---------------------------------------------------------------
-  app.get("/v1/admin/users", async (req) => {
+  //
+  // The full user-management module (Prompt 03). The list endpoint accepts
+  // the same pagination+search contract as before, but adds:
+  //   - status filter (active | restricted | banned | muted | frozen)
+  //   - country filter
+  //   - agency filter
+  //   - registration-date range filter (YYYY-MM-DD)
+  //   - hasRestriction filter
+  //   - safe sort whitelist
+  //   - masking of contact info when the admin lacks `players.read`
+  //   - account-status derivation from the live PlayerRestriction table
+  //
+  // Permission model:
+  //   - `users.read` is required to call this endpoint at all.
+  //   - `wallet.read` gates the `balance` field (returns null otherwise).
+  //   - `players.read` gates unmasked phone/email (returns masked otherwise).
+  //
+  // The endpoint NEVER returns passwordHash, tokens, or full contact info
+  // to admins who lack the relevant permission.
+  app.get("/v1/admin/users/summary", async (req) => {
     await requireAdmin(req, "users.read");
-    const q = validate(paginationQuery, queryOf(req));
-    const where = q.search
-      ? { OR: [{ displayName: { contains: q.search, mode: "insensitive" as const } }, { phone: { contains: q.search } }, { email: { contains: q.search } }] }
-      : {};
-    const [total, items] = await Promise.all([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        orderBy: { id: "asc" },
-        skip: (q.page - 1) * q.pageSize,
-        take: q.pageSize,
-        include: { wallet: { select: { balance: true, frozen: true } }, agency: { select: { id: true, name: true } } },
-      }),
+    const now = new Date();
+    const last7d = new Date(now.getTime() - 7 * 86_400_000);
+    const last30d = new Date(now.getTime() - 30 * 86_400_000);
+    const [totalUsers, newUsers7d, newUsers30d, banned, muted, frozen, restrictedAny] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: { createdAt: { gte: last7d } } }),
+      prisma.user.count({ where: { createdAt: { gte: last30d } } }),
+      prisma.playerRestriction.count({ where: { type: "ban", OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] } }),
+      prisma.playerRestriction.count({ where: { type: "mute", OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] } }),
+      prisma.playerRestriction.count({ where: { type: "freeze_wallet", OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] } }),
+      prisma.playerRestriction.count({ where: { OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] } }),
     ]);
     return {
       ok: true,
       data: {
-        total, page: q.page, pageSize: q.pageSize,
-        items: items.map((u) => ({ id: u.id, displayName: u.displayName, phone: u.phone, email: u.email, marketCode: u.marketCode, country: u.country, vipLevel: u.vipLevel, nobleLevel: u.nobleLevel, balance: u.wallet?.balance ?? 0, frozen: u.wallet?.frozen ?? false, agency: u.agency?.name ?? null, createdAt: u.createdAt })),
+        totalUsers,
+        newUsers7d,
+        newUsers30d,
+        // "Active" = total minus currently-restricted accounts.
+        active: Math.max(0, totalUsers - restrictedAny),
+        restricted: restrictedAny,
+        banned,
+        muted,
+        frozen,
       },
     };
+  });
+
+  app.get("/v1/admin/users", async (req) => {
+    const admin = await requireAdmin(req, "users.read");
+    const q = validate(userListQuerySchema, queryOf(req));
+    const canViewContact = admin.role.permissions.some((p) => p.permission.key === "players.read");
+    const canViewWallet = admin.role.permissions.some((p) => p.permission.key === "wallet.read");
+
+    // Compose the where clause from validated filters.
+    const where: Prisma.UserWhereInput = {};
+    if (q.search) {
+      // Numeric search → by id; otherwise by displayName / phone / email (contains).
+      const asNum = Number(q.search);
+      if (!Number.isNaN(asNum) && Number.isInteger(asNum)) {
+        where.id = asNum;
+      } else {
+        where.OR = [
+          { displayName: { contains: q.search, mode: "insensitive" } },
+          { phone: { contains: q.search } },
+          { email: { contains: q.search, mode: "insensitive" } },
+        ];
+      }
+    }
+    if (q.country) where.country = q.country.toUpperCase();
+    if (q.agencyId) where.agencyId = q.agencyId;
+    if (q.registeredFrom || q.registeredTo) {
+      where.createdAt = {};
+      if (q.registeredFrom) where.createdAt.gte = new Date(`${q.registeredFrom}T00:00:00.000Z`);
+      // registeredTo is inclusive — roll forward one day so the user's
+      // "to" day is included.
+      if (q.registeredTo) {
+        const t = new Date(`${q.registeredTo}T00:00:00.000Z`);
+        t.setUTCDate(t.getUTCDate() + 1);
+        where.createdAt.lt = t;
+      }
+    }
+
+    // Status filter requires a join to PlayerRestriction. We translate the
+    // user-facing status enum into a `restrictions.some` predicate.
+    if (q.status || q.hasRestriction) {
+      const now = new Date();
+      const activeWindow = { OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] };
+      if (q.status === "banned") where.restrictions = { some: { type: "ban", ...activeWindow } };
+      else if (q.status === "muted") where.restrictions = { some: { type: "mute", ...activeWindow } };
+      else if (q.status === "frozen") where.restrictions = { some: { type: "freeze_wallet", ...activeWindow } };
+      else if (q.status === "restricted") where.restrictions = { some: { ...activeWindow } };
+      else if (q.status === "active") where.restrictions = { none: { ...activeWindow } };
+      if (q.hasRestriction === "true") where.restrictions = { some: { ...activeWindow } };
+      else if (q.hasRestriction === "false") where.restrictions = { none: { ...activeWindow } };
+    }
+
+    // Safe sort whitelist (prevents arbitrary column sort = info disclosure).
+    const sortWhitelist = ["id", "displayName", "country", "createdAt", "vipLevel", "nobleLevel"];
+    const sortBy = q.sortBy && sortWhitelist.includes(q.sortBy) ? q.sortBy : "id";
+    const orderBy = { [sortBy]: q.sortDir } as const;
+
+    const [total, items] = await Promise.all([
+      prisma.user.count({ where }),
+      prisma.user.findMany({
+        where,
+        orderBy,
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          wallet: { select: { balance: true, frozen: true } },
+          agency: { select: { id: true, name: true } },
+          restrictions: { where: { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] }, select: { type: true, expiresAt: true, reason: true } },
+        },
+      }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((u) => {
+          // Derive the account-status label from the live restrictions.
+          const activeRestrictions = u.restrictions;
+          const status = activeRestrictions.some((r) => r.type === "ban") ? "banned"
+            : activeRestrictions.some((r) => r.type === "freeze_wallet") ? "frozen"
+            : activeRestrictions.some((r) => r.type === "mute") ? "muted"
+            : activeRestrictions.length > 0 ? "restricted"
+            : "active";
+          return {
+            id: u.id,
+            displayName: u.displayName,
+            avatarUrl: u.avatarUrl || "",
+            // Mask contact info unless the admin has players.read.
+            phone: canViewContact ? u.phone : maskContact(u.phone),
+            email: canViewContact ? u.email : maskContact(u.email),
+            marketCode: u.marketCode,
+            country: u.country,
+            vipLevel: u.vipLevel,
+            nobleLevel: u.nobleLevel,
+            // Balance is null when wallet.read is missing (frontend shows "—").
+            balance: canViewWallet ? (u.wallet?.balance ?? 0) : null,
+            walletFrozen: u.wallet?.frozen ?? false,
+            agencyId: u.agency?.id ?? null,
+            agency: u.agency?.name ?? null,
+            status,
+            restrictions: activeRestrictions.map((r) => ({ type: r.type, reason: r.reason, expiresAt: r.expiresAt?.toISOString() ?? null })),
+            createdAt: u.createdAt.toISOString(),
+          };
+        }),
+      },
+    };
+  });
+
+  /**
+   * Full user profile — the User Detail page data source. All activity
+   * sections are fetched with bounded `take` (no full-table scans into
+   * memory) and permission-gated per section.
+   *
+   * Sections:
+   *   - profile          — always returned (subject to users.read)
+   *   - wallet           — only when caller has wallet.read
+   *   - bets / sessions  — only when caller has rounds.read
+   *   - live / gifts     — only when caller has rooms.read
+   *   - complaints       — only when caller has players.read
+   *   - restrictions     — always (subject to users.read)
+   *   - adminNotes       — only when caller has users.write
+   *   - auditHistory    — only when caller has security.read
+   */
+  app.get("/v1/admin/users/:id", async (req) => {
+    const admin = await requireAdmin(req, "users.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const canViewContact = admin.role.permissions.some((p) => p.permission.key === "players.read");
+    const canViewWallet = admin.role.permissions.some((p) => p.permission.key === "wallet.read");
+    const canViewRounds = admin.role.permissions.some((p) => p.permission.key === "rounds.read");
+    const canViewRooms = admin.role.permissions.some((p) => p.permission.key === "rooms.read");
+    const canViewSecurity = admin.role.permissions.some((p) => p.permission.key === "security.read");
+    const canViewNotes = admin.role.permissions.some((p) => p.permission.key === "users.write");
+
+    // Always include agency + restrictions + wallet. Wallet fields are
+    // masked-out below if the caller lacks wallet.read. (Conditional include
+    // would narrow the TS type and lose the wallet relation — so we always
+    // fetch and redact.)
+    //
+    // Note: PlayerRestriction has only `createdBy Int` (no relation to
+    // AdminUser in the existing schema), so we don't include a creator
+    // join here. If future work adds the relation, re-enable it.
+    const user = await prisma.user.findUnique({
+      where: { id },
+      include: {
+        wallet: { select: { balance: true, frozen: true, updatedAt: true } },
+        agency: { select: { id: true, name: true, code: true } },
+        restrictions: { orderBy: { id: "desc" }, take: 50 },
+      },
+    });
+    if (!user) throw notFound("user not found");
+
+    // Parallel bounded fetches — only run the ones the caller is allowed to see.
+    const [bets, sessions, ledgerRecent, gifts, complaints, roomParticipations, roomsCreated, adminNotes, auditHistory] = await Promise.all([
+      canViewRounds
+        ? prisma.bet.findMany({ where: { userId: id }, orderBy: { id: "desc" }, take: 20, include: { game: { select: { code: true, name: true } }, round: { select: { roundId: true, status: true, startedAt: true, endedAt: true } } } })
+        : Promise.resolve([]),
+      canViewRounds
+        ? prisma.gameSession.findMany({ where: { userId: id }, orderBy: { id: "desc" }, take: 20, include: { game: { select: { code: true, name: true } } } })
+        : Promise.resolve([]),
+      canViewWallet
+        ? prisma.ledgerEntry.findMany({ where: { userId: id }, orderBy: { id: "desc" }, take: 15, select: { id: true, kind: true, amount: true, balanceAfter: true, txKey: true, createdAt: true } })
+        : Promise.resolve([]),
+      canViewRooms
+        ? prisma.giftTransaction.findMany({ where: { OR: [{ senderId: id }, { recipientId: id }] }, orderBy: { id: "desc" }, take: 15, include: { gift: { select: { name: true } }, sender: { select: { id: true, displayName: true } }, recipient: { select: { id: true, displayName: true } } } })
+        : Promise.resolve([]),
+      canViewContact
+        ? prisma.complaint.findMany({ where: { userId: id }, orderBy: { id: "desc" }, take: 20 })
+        : Promise.resolve([]),
+      canViewRooms
+        ? prisma.roomParticipant.findMany({ where: { userId: id }, orderBy: { id: "desc" }, take: 20, include: { room: { select: { id: true, title: true, type: true, closedAt: true } } } })
+        : Promise.resolve([]),
+      canViewRooms
+        ? prisma.room.findMany({ where: { hostId: id }, orderBy: { id: "desc" }, take: 10, select: { id: true, title: true, type: true, createdAt: true, closedAt: true } })
+        : Promise.resolve([]),
+      canViewNotes
+        ? prisma.adminNote.findMany({ where: { userId: id }, orderBy: { id: "desc" }, take: 50, include: { admin: { select: { id: true, username: true, displayName: true } } } })
+        : Promise.resolve([]),
+      canViewSecurity
+        ? prisma.auditLog.findMany({ where: { entity: "user", entityId: String(id) }, orderBy: { id: "desc" }, take: 30, include: { admin: { select: { id: true, username: true, displayName: true } } } })
+        : Promise.resolve([]),
+    ]);
+
+    // Wallet totals — credits are positive ledger amounts, debits are negative.
+    // Use Prisma `aggregate` (single-row aggregation) instead of groupBy.
+    let credits = 0;
+    let debits = 0;
+    let ledgerSum = 0;
+    if (canViewWallet) {
+      const creditsAgg = await prisma.ledgerEntry.aggregate({ where: { userId: id, amount: { gt: 0 } }, _sum: { amount: true } });
+      credits = creditsAgg._sum.amount ?? 0;
+      const debitsAgg = await prisma.ledgerEntry.aggregate({ where: { userId: id, amount: { lt: 0 } }, _sum: { amount: true } });
+      debits = Math.abs(debitsAgg._sum.amount ?? 0);
+      const totalAgg = await prisma.ledgerEntry.aggregate({ where: { userId: id }, _sum: { amount: true } });
+      ledgerSum = totalAgg._sum.amount ?? 0;
+    }
+
+    return {
+      ok: true,
+      data: {
+        profile: {
+          id: user.id,
+          displayName: user.displayName,
+          avatarUrl: user.avatarUrl || "",
+          phone: canViewContact ? user.phone : maskContact(user.phone),
+          email: canViewContact ? user.email : maskContact(user.email),
+          marketCode: user.marketCode,
+          country: user.country,
+          vipLevel: user.vipLevel,
+          nobleLevel: user.nobleLevel,
+          isBot: user.isBot,
+          agency: user.agency ? { id: user.agency.id, name: user.agency.name, code: user.agency.code } : null,
+          createdAt: user.createdAt.toISOString(),
+          updatedAt: user.updatedAt.toISOString(),
+          // Contact-masked flag so the UI can show a "masked" indicator.
+          contactMasked: !canViewContact,
+        },
+        restrictions: user.restrictions.map((r) => ({
+          id: r.id,
+          type: r.type,
+          reason: r.reason,
+          expiresAt: r.expiresAt?.toISOString() ?? null,
+          createdAt: r.createdAt.toISOString(),
+          createdBy: r.createdBy,
+          // creator info would require a relation on PlayerRestriction — currently just an int.
+          creator: null,
+        })),
+        wallet: canViewWallet
+          ? {
+              balance: user.wallet?.balance ?? 0,
+              frozen: user.wallet?.frozen ?? false,
+              updatedAt: user.wallet?.updatedAt?.toISOString() ?? null,
+              totalCredits: credits,
+              totalDebits: debits,
+              // LedgerEntry.id is BigInt — Fastify's JSON serializer can't
+              // stringify BigInt by default, so we map each entry's id to
+              // a string before sending. (Matches the existing /wallet/ledger
+              // endpoint's `id: e.id.toString()` convention.)
+              ledgerRecent: ledgerRecent.map((e) => ({ ...e, id: e.id.toString(), createdAt: e.createdAt.toISOString() })),
+            }
+          : null,
+        bets: canViewRounds ? bets : [],
+        sessions: canViewRounds ? sessions : [],
+        gifts: canViewRooms ? gifts : [],
+        complaints: canViewContact ? complaints : [],
+        roomParticipations: canViewRooms ? roomParticipations : [],
+        roomsCreated: canViewRooms ? roomsCreated : [],
+        adminNotes,
+        auditHistory,
+        // Permission flags so the frontend can show/hide sections without
+        // a second round-trip.
+        perms: {
+          canViewWallet,
+          canViewRounds,
+          canViewRooms,
+          canViewContact,
+          canViewSecurity,
+          canViewNotes,
+          canEdit: admin.role.permissions.some((p) => p.permission.key === "users.write"),
+          canRestrict: admin.role.permissions.some((p) => p.permission.key === "players.write"),
+          canWalletWrite: admin.role.permissions.some((p) => p.permission.key === "wallet.write"),
+        },
+        // sumAmount kept for back-compat; equal to (credits - debits).
+        ledgerSum,
+      },
+    };
+  });
+
+  /**
+   * Edit safe profile fields. Excludes password/phone/email — those go
+   * through the auth flows (registration, OTP, password reset) and must
+   * NOT be edited from the admin panel directly.
+   */
+  app.put("/v1/admin/users/:id", async (req) => {
+    const admin = await requireAdmin(req, "users.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(userUpdateSchema, bodyOf(req));
+    const before = await prisma.user.findUnique({ where: { id } });
+    if (!before) throw notFound("user not found");
+    // Validate agency if provided.
+    if (input.agencyId) {
+      const agency = await prisma.agency.findUnique({ where: { id: input.agencyId } });
+      if (!agency) throw badRequest("unknown agency");
+    }
+    const after = await prisma.user.update({ where: { id }, data: input });
+    await writeAudit({ adminId: admin.id, req, action: "update_profile", entity: "user", entityId: id, before: { displayName: before.displayName, country: before.country, agencyId: before.agencyId, vipLevel: before.vipLevel, nobleLevel: before.nobleLevel, avatarUrl: before.avatarUrl }, after: { displayName: after.displayName, country: after.country, agencyId: after.agencyId, vipLevel: after.vipLevel, nobleLevel: after.nobleLevel, avatarUrl: after.avatarUrl } });
+    return { ok: true, data: { id: after.id, displayName: after.displayName, country: after.country, agencyId: after.agencyId, vipLevel: after.vipLevel, nobleLevel: after.nobleLevel, avatarUrl: after.avatarUrl } };
+  });
+
+  /**
+   * Apply (or replace) a restriction. Idempotent: if the user already has an
+   * active restriction of the same type, we lift the old one and write a new
+   * one with the new expiry/reason — preventing duplicate bans.
+   */
+  app.post("/v1/admin/users/:id/restrict", async (req) => {
+    const admin = await requireAdmin(req, "players.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      type: z.enum(RESTRICTION_TYPES),
+      reason: z.string().trim().min(1).max(200),
+      durationDays: z.coerce.number().int().min(1).max(3650).optional(),
+      note: z.string().trim().max(500).optional(),
+    }), bodyOf(req));
+
+    const user = await prisma.user.findUnique({ where: { id } });
+    if (!user) throw notFound("user not found");
+
+    // Lift any existing active restriction of the same type (idempotent).
+    await prisma.playerRestriction.updateMany({
+      where: { userId: id, type: input.type, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+      data: { expiresAt: new Date() },
+    });
+
+    const expiresAt = input.durationDays
+      ? new Date(Date.now() + input.durationDays * 86_400_000)
+      : null;
+
+    const restriction = await prisma.playerRestriction.create({
+      data: {
+        userId: id,
+        type: input.type,
+        reason: input.reason,
+        createdBy: admin.id,
+        expiresAt,
+      },
+    });
+
+    await writeAudit({
+      adminId: admin.id, req,
+      action: `restrict_${input.type}`,
+      entity: "user", entityId: id,
+      after: { restrictionId: restriction.id, type: input.type, reason: input.reason, expiresAt: expiresAt?.toISOString() ?? null, note: input.note ?? "" },
+    });
+
+    return { ok: true, data: { id: restriction.id, type: restriction.type, reason: restriction.reason, expiresAt: restriction.expiresAt?.toISOString() ?? null } };
+  });
+
+  /** Lift (revoke) a specific restriction by id. */
+  app.delete("/v1/admin/users/:id/restrictions/:rid", async (req) => {
+    const admin = await requireAdmin(req, "players.write");
+    const { id, rid } = validate(z.object({ id: z.coerce.number(), rid: z.coerce.number() }), paramsOf(req));
+    const before = await prisma.playerRestriction.findUnique({ where: { id: rid } });
+    if (!before) throw notFound("restriction not found");
+    if (before.userId !== id) throw badRequest("restriction does not belong to this user");
+    // Soft-delete by setting expiresAt to now — preserves the audit trail
+    // (we never hard-delete restrictions).
+    await prisma.playerRestriction.update({ where: { id: rid }, data: { expiresAt: new Date() } });
+    await writeAudit({ adminId: admin.id, req, action: `lift_${before.type}`, entity: "user", entityId: id, before: { restrictionId: rid, type: before.type, reason: before.reason } });
+    return { ok: true };
+  });
+
+  // --- Admin notes --------------------------------------------------------
+  app.get("/v1/admin/users/:id/notes", async (req) => {
+    await requireAdmin(req, "users.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const user = await prisma.user.findUnique({ where: { id }, select: { id: true } });
+    if (!user) throw notFound("user not found");
+    const notes = await prisma.adminNote.findMany({
+      where: { userId: id },
+      orderBy: { id: "desc" },
+      take: 100,
+      include: { admin: { select: { id: true, username: true, displayName: true } } },
+    });
+    return { ok: true, data: notes };
+  });
+
+  app.post("/v1/admin/users/:id/notes", async (req) => {
+    const admin = await requireAdmin(req, "users.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(adminNoteSchema, bodyOf(req));
+    const user = await prisma.user.findUnique({ where: { id }, select: { id: true } });
+    if (!user) throw notFound("user not found");
+    const note = await prisma.adminNote.create({
+      data: {
+        userId: id,
+        adminId: admin.id,
+        category: input.category,
+        body: input.body,
+        internal: input.internal,
+      },
+    });
+    await writeAudit({ adminId: admin.id, req, action: "add_note", entity: "user", entityId: id, after: { noteId: note.id, category: note.category } });
+    return { ok: true, data: note };
+  });
+
+  app.delete("/v1/admin/users/:id/notes/:nid", async (req) => {
+    const admin = await requireAdmin(req, "users.write");
+    const { id, nid } = validate(z.object({ id: z.coerce.number(), nid: z.coerce.number() }), paramsOf(req));
+    const before = await prisma.adminNote.findUnique({ where: { id: nid } });
+    if (!before) throw notFound("note not found");
+    if (before.userId !== id) throw badRequest("note does not belong to this user");
+    await prisma.adminNote.delete({ where: { id: nid } });
+    await writeAudit({ adminId: admin.id, req, action: "delete_note", entity: "user", entityId: id, before: { noteId: nid, category: before.category } });
+    return { ok: true };
+  });
+
+  /**
+   * CSV export of the filtered user list. Permission-gated per field:
+   *   - balance column omitted unless caller has wallet.read
+   *   - phone/email columns masked unless caller has players.read
+   *   - hard cap of 5000 rows
+   *   - spreadsheet-formula-injection sanitization (=, +, -, @, tab, CR)
+   */
+  app.get("/v1/admin/users/export", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req, reply) => {
+    const admin = await requireAdmin(req, "users.read");
+    const q = validate(userListQuerySchema, queryOf(req));
+    const canViewContact = admin.role.permissions.some((p) => p.permission.key === "players.read");
+    const canViewWallet = admin.role.permissions.some((p) => p.permission.key === "wallet.read");
+
+    // Reuse the same where-clause builder as the list endpoint.
+    const where: Prisma.UserWhereInput = {};
+    if (q.search) {
+      const asNum = Number(q.search);
+      if (!Number.isNaN(asNum) && Number.isInteger(asNum)) where.id = asNum;
+      else where.OR = [
+        { displayName: { contains: q.search, mode: "insensitive" } },
+        { phone: { contains: q.search } },
+        { email: { contains: q.search, mode: "insensitive" } },
+      ];
+    }
+    if (q.country) where.country = q.country.toUpperCase();
+    if (q.agencyId) where.agencyId = q.agencyId;
+    if (q.registeredFrom || q.registeredTo) {
+      const createdAtFilter: Prisma.DateTimeFilter = {};
+      if (q.registeredFrom) createdAtFilter.gte = new Date(`${q.registeredFrom}T00:00:00.000Z`);
+      if (q.registeredTo) {
+        const t = new Date(`${q.registeredTo}T00:00:00.000Z`);
+        t.setUTCDate(t.getUTCDate() + 1);
+        createdAtFilter.lt = t;
+      }
+      where.createdAt = createdAtFilter;
+    }
+    if (q.status) {
+      const now = new Date();
+      const w: Prisma.PlayerRestrictionWhereInput = { OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] };
+      if (q.status === "banned") where.restrictions = { some: { type: "ban", ...w } };
+      else if (q.status === "muted") where.restrictions = { some: { type: "mute", ...w } };
+      else if (q.status === "frozen") where.restrictions = { some: { type: "freeze_wallet", ...w } };
+      else if (q.status === "restricted") where.restrictions = { some: { ...w } };
+      else if (q.status === "active") where.restrictions = { none: { ...w } };
+    }
+
+    const rows = await prisma.user.findMany({
+      where,
+      orderBy: { id: "asc" },
+      take: 5000,
+      include: {
+        wallet: canViewWallet ? { select: { balance: true } } : false,
+        agency: { select: { name: true } },
+      },
+    });
+
+    const headers = ["id", "displayName", "country", "marketCode", "agency", "vipLevel", "createdAt"];
+    if (canViewContact) headers.push("phone", "email");
+    if (canViewWallet) headers.push("balance");
+
+    const escape = (v: unknown): string => {
+      let s = v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      // Spreadsheet formula-injection defence: prefix with a single quote
+      // if the cell starts with =, +, -, @, tab (0x09), or CR (0x0D).
+      if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+      // Quote any cell containing comma, quote, or newline.
+      if (/[",\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+
+    const lines = [
+      headers.join(","),
+      ...rows.map((u) => headers.map((h) => {
+        switch (h) {
+          case "id": return escape(u.id);
+          case "displayName": return escape(u.displayName);
+          case "country": return escape(u.country);
+          case "marketCode": return escape(u.marketCode);
+          case "agency": return escape(u.agency?.name ?? "");
+          case "vipLevel": return escape(u.vipLevel);
+          case "createdAt": return escape(u.createdAt.toISOString());
+          case "phone": return escape(canViewContact ? (u.phone ?? "") : maskContact(u.phone) ?? "");
+          case "email": return escape(canViewContact ? (u.email ?? "") : maskContact(u.email) ?? "");
+          case "balance": return escape(u.wallet?.balance ?? 0);
+          default: return "";
+        }
+      }).join(",")),
+    ];
+
+    const csv = lines.join("\n");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    reply.header("content-type", "text/csv; charset=utf-8");
+    reply.header("content-disposition", `attachment; filename="users-${stamp}.csv"`);
+    reply.header("x-export-row-count", String(rows.length));
+    return csv;
   });
 
   // --- Agencies ------------------------------------------------------------

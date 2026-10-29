@@ -43,6 +43,7 @@ model User {
   complaints     Complaint[]
   refreshTokens  Session[]
   agencyMembers  AgencyMember[]
+  adminNotes     AdminNote[]
 
   @@index([agencyId])
   @@index([marketCode])
@@ -89,10 +90,11 @@ model AdminUser {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
-  role      Role       @relation(fields: [roleId], references: [id])
-  agency    Agency?    @relation(fields: [agencyId], references: [id])
-  auditLogs AuditLog[]
-  refunds   Refund[]
+  role       Role       @relation(fields: [roleId], references: [id])
+  agency     Agency?    @relation(fields: [agencyId], references: [id])
+  auditLogs  AuditLog[]
+  refunds    Refund[]
+  adminNotes AdminNote[]
 
   @@index([roleId])
 }
@@ -556,6 +558,33 @@ model AuditLog {
   @@index([entity, entityId])
   @@index([adminId])
   @@index([createdAt])
+}
+
+/**
+ * Internal administrative notes attached to a user.
+ *
+ * Created by Super Admins to record moderation context, review history, and
+ * shift hand-off notes. NEVER exposed to the mobile app — these are internal
+ * records used to coordinate admin actions.
+ *
+ * `internal` defaults to true; even when set to false, the field is still
+ * surfaced only inside the admin panel (no public endpoint reads it). The
+ * flag exists so future customer-facing note features can opt-in per note.
+ */
+model AdminNote {
+  id        Int        @id @default(autoincrement())
+  userId    Int
+  adminId   Int?
+  category  String     @default("general") // general | review | moderation | escalation | financial | other
+  body      String
+  internal  Boolean    @default(true)
+  createdAt DateTime   @default(now())
+  user      User       @relation(fields: [userId], references: [id])
+  admin     AdminUser? @relation(fields: [adminId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([adminId])
+  @@index([category])
 }
 
 model SecurityEvent {
