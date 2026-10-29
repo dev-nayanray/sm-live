@@ -54,7 +54,8 @@ app.get("/launch", async (req, reply) => {
 
   const gameCode = (q.game as string | undefined) ?? "crash-x";
   const existing = sessions.get(session);
-  const rtp = existing?.rtp ?? (q.rtp ? Number(q.rtp) : NaN) || env.DEFAULT_RTP;
+  const qRtp = q.rtp !== undefined ? Number(q.rtp) : NaN;
+  const rtp = existing?.rtp ?? (Number.isNaN(qRtp) ? env.DEFAULT_RTP : qRtp);
   sessions.set(session, { sessionKey: session, userId: Number(user), gameCode, rtp, roundId: existing?.roundId ?? null, openBets: existing?.openBets ?? [] });
   return reply.type("text/html").send(gamePage({ session, user: Number(user), gameCode, rtp }));
 });

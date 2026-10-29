@@ -103,18 +103,34 @@ export async function providerRoutes(app: FastifyInstance) {
         meta: { roundId: input.roundId, game: session.game.code },
       },
     ]);
+    const entry = result.entries[0]!;
 
-    const bet = await prisma.bet.create({
-      data: {
-        roundId: round.id,
-        sessionId: session.id,
-        userId: session.userId,
-        gameKey: session.gameId,
-        amount: input.amount,
-        providerTxId: input.txId,
-        status: "placed",
-      },
-    });
+    if (entry.replayed) {
+      // lost a race against a concurrent identical call — return the winner's bet
+      const winner = await prisma.bet.findUnique({ where: { providerTxId: input.txId } });
+      return { ok: true, data: { betId: winner?.id ?? null, status: winner?.status ?? "placed", replayed: true, balance: entry.balanceAfter } };
+    }
+
+    let bet;
+    try {
+      bet = await prisma.bet.create({
+        data: {
+          roundId: round.id,
+          sessionId: session.id,
+          userId: session.userId,
+          gameKey: session.gameId,
+          amount: input.amount,
+          providerTxId: input.txId,
+          status: "placed",
+        },
+      });
+    } catch (e) {
+      if ((e as { code?: string }).code === "P2002") {
+        const winner = await prisma.bet.findUnique({ where: { providerTxId: input.txId } });
+        return { ok: true, data: { betId: winner?.id ?? null, status: winner?.status ?? "placed", replayed: true, balance: entry.balanceAfter } };
+      }
+      throw e;
+    }
 
     return {
       ok: true,
