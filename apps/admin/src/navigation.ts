@@ -111,10 +111,10 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       {
         to: "/live",
-        label: "Live & Voice Rooms",
+        label: "Live Room Monitoring",
         perm: "rooms.read",
         icon: "mic",
-        hint: "Monitor live / voice / party rooms (existing page).",
+        hint: "Monitor live / voice / party rooms, participants, reports, and moderation actions.",
       },
       {
         to: null,

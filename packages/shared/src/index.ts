@@ -344,6 +344,39 @@ export const agencyListQuerySchema = paginationQuery.extend({
 });
 export type AgencyListQuery = z.infer<typeof agencyListQuerySchema>;
 
+// ---------------------------------------------------------------------------
+// Live room monitoring & moderation (Prompt 05)
+// ---------------------------------------------------------------------------
+
+// ROOM_TYPES is already defined above (line 36) — reused as-is.
+
+export const ROOM_REPORT_CATEGORIES = [
+  "harassment", "inappropriate_content", "spam", "impersonation", "suspicious", "other",
+] as const;
+export const ROOM_REPORT_STATUSES = ["open", "in_review", "resolved", "dismissed"] as const;
+
+export const roomReportCreateSchema = z.object({
+  reporterId: z.coerce.number().int().positive().nullable().optional(),
+  reportedUserId: z.coerce.number().int().positive().nullable().optional(),
+  category: z.enum(ROOM_REPORT_CATEGORIES).default("other"),
+  description: z.string().trim().min(1).max(2000),
+});
+
+export const roomReportUpdateSchema = z.object({
+  status: z.enum(ROOM_REPORT_STATUSES).optional(),
+  reviewNote: z.string().trim().max(1000).optional(),
+});
+
+export const roomListQuerySchema = paginationQuery.extend({
+  type: z.enum(ROOM_TYPES).optional(),
+  status: z.enum(["active", "closed"]).optional(),
+  hostId: z.coerce.number().int().positive().optional(),
+  hasReports: z.enum(["true", "false"]).optional(),
+  createdFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  createdTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+export type RoomListQuery = z.infer<typeof roomListQuerySchema>;
+
 // --- Public app config (response of GET /v1/config/app) ---
 export interface AppConfigGift { id: number; name: string; iconUrl: string; price: number; category: string; animation: string; }
 export interface AppConfigGame { code: string; name: string; thumbnailUrl: string; isPro: boolean; status: string; minBet: number; maxBet: number; }

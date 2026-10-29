@@ -7,6 +7,8 @@ import { Layout } from "./components/Layout";
 import { Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
 import { LiveVoice } from "./pages/LiveVoice";
+import { LiveRooms } from "./pages/LiveRooms";
+import { RoomDetail } from "./pages/RoomDetail";
 import { UsersAgencies } from "./pages/UsersAgencies";
 import { UserDetail } from "./pages/UserDetail";
 import { Agencies } from "./pages/Agencies";
@@ -53,7 +55,9 @@ function Shell() {
         {/* Existing pages, kept on their original paths to avoid breaking
             bookmarks, e2e selectors and the smoke test. */}
         <Route path="/dashboard" element={<RequirePerm perm="dashboard.view"><Dashboard /></RequirePerm>} />
-        <Route path="/live" element={<RequirePerm perm="rooms.read"><LiveVoice /></RequirePerm>} />
+        <Route path="/live" element={<RequirePerm perm="rooms.read"><LiveRooms /></RequirePerm>} />
+        <Route path="/live/:id" element={<RequirePerm perm="rooms.read"><RoomDetail /></RequirePerm>} />
+        <Route path="/live-content" element={<RequirePerm perm="rooms.read"><LiveVoice /></RequirePerm>} />
         <Route path="/users" element={<RequirePerm perm="users.read"><UsersAgencies /></RequirePerm>} />
         <Route path="/users/:id" element={<RequirePerm perm="users.read"><UserDetail /></RequirePerm>} />
         <Route path="/agencies" element={<RequirePerm perm="agencies.read"><Agencies /></RequirePerm>} />

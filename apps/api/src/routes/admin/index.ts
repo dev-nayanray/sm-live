@@ -6,6 +6,7 @@ import {
   userListQuerySchema, userUpdateSchema, adminNoteSchema,
   maskContact, RESTRICTION_TYPES,
   agencyCreateSchema, agencyUpdateSchema, agencyStatusChangeSchema, agencyListQuerySchema,
+  roomReportCreateSchema, roomReportUpdateSchema, roomListQuerySchema,
 } from "@sm-live/shared";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
@@ -15,6 +16,7 @@ import { requireAdmin, signAdminToken, verifyPassword, hashPassword } from "../.
 import { writeAudit, recordApiError } from "../../lib/audit.js";
 import { postLedgerEntries, ledgerIntegrityCheck } from "../../services/ledger.service.js";
 import { getPaymentAdapter } from "../../services/payment.adapter.js";
+import { emitToRoom } from "../../socket.js";
 import os from "node:os";
 
 /**
@@ -1582,26 +1584,427 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // --- Rooms ---------------------------------------------------------------
+  //
+  // Live Room Monitoring & Moderation module (Prompt 05).
+  //
+  // Replaces the existing minimal room list + close endpoints with a full
+  // monitoring system: summary KPIs, filtered/paginated room list, room
+  // detail with participants + reports + event timeline, admin participant
+  // moderation (kick / mute), room reports CRUD, room close with reason.
+  //
+  // Permissions:
+  //   - rooms.read  — view room lists, details, participants, reports, events
+  //   - rooms.write — close rooms, kick/mute participants, manage reports
+  //
+  // Real-time approach: polling with manual refresh (15s default). The
+  // existing socket.io uses user JWT auth (not admin JWT), so adding admin
+  // socket subscriptions would require a separate auth path — documented as
+  // a future enhancement. Admin kick/mute actions DO emit socket.io events
+  // to notify connected room participants in real time.
+  app.get("/v1/admin/rooms/summary", async (req) => {
+    await requireAdmin(req, "rooms.read");
+    const [activeLive, activeVoice, activeParty, totalParticipants, openReports] = await Promise.all([
+      prisma.room.count({ where: { closedAt: null, type: "live" } }),
+      prisma.room.count({ where: { closedAt: null, type: "voice" } }),
+      prisma.room.count({ where: { closedAt: null, type: "party" } }),
+      prisma.roomParticipant.count({ where: { leftAt: null, kickedAt: null } }),
+      prisma.roomReport.count({ where: { status: { in: ["open", "in_review"] } } }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        activeLiveRooms: activeLive,
+        activeVoiceRooms: activeVoice,
+        activePartyRooms: activeParty,
+        totalActiveRooms: activeLive + activeVoice + activeParty,
+        totalParticipants,
+        openReports,
+        // Documented gap: no real-time presence / heartbeat / stream-quality
+        // metrics exist in the current schema.
+        hasRealtimePresence: false,
+        hasStreamHealthMetrics: false,
+      },
+    };
+  });
+
   app.get("/v1/admin/rooms", async (req) => {
     await requireAdmin(req, "rooms.read");
-    const q = validate(paginationQuery, queryOf(req));
-    const where = q.search ? { title: { contains: q.search, mode: "insensitive" as const } } : {};
+    const q = validate(roomListQuerySchema, queryOf(req));
+    const where: Prisma.RoomWhereInput = {};
+    if (q.search) {
+      const asNum = Number(q.search);
+      if (!Number.isNaN(asNum) && Number.isInteger(asNum)) {
+        where.id = asNum;
+      } else {
+        where.OR = [
+          { title: { contains: q.search, mode: "insensitive" } },
+          { host: { displayName: { contains: q.search, mode: "insensitive" } } },
+        ];
+      }
+    }
+    if (q.type) where.type = q.type;
+    if (q.status === "active") where.closedAt = null;
+    else if (q.status === "closed") where.closedAt = { not: null };
+    if (q.hostId) where.hostId = q.hostId;
+    if (q.createdFrom || q.createdTo) {
+      const f: Prisma.DateTimeFilter = {};
+      if (q.createdFrom) f.gte = new Date(`${q.createdFrom}T00:00:00.000Z`);
+      if (q.createdTo) {
+        const t = new Date(`${q.createdTo}T00:00:00.000Z`);
+        t.setUTCDate(t.getUTCDate() + 1);
+        f.lt = t;
+      }
+      where.createdAt = f;
+    }
+    if (q.hasReports === "true") where.reports = { some: { status: { in: ["open", "in_review"] } } };
+    else if (q.hasReports === "false") where.reports = { none: { status: { in: ["open", "in_review"] } } };
+
+    const sortWhitelist = ["id", "title", "type", "createdAt", "closedAt"];
+    const sortBy = q.sortBy && sortWhitelist.includes(q.sortBy) ? q.sortBy : "id";
+    const orderBy = { [sortBy]: q.sortDir } as const;
+
     const [total, items] = await Promise.all([
       prisma.room.count({ where }),
       prisma.room.findMany({
-        where, orderBy: { id: "desc" }, skip: (q.page - 1) * q.pageSize, take: q.pageSize,
-        include: { host: { select: { id: true, displayName: true } }, participants: { where: { leftAt: null, kickedAt: null } } },
+        where,
+        orderBy,
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          host: { select: { id: true, displayName: true, avatarUrl: true } },
+          _count: {
+            select: {
+              participants: { where: { leftAt: null, kickedAt: null } },
+              reports: { where: { status: { in: ["open", "in_review"] } } },
+            },
+          },
+        },
       }),
     ]);
-    return { ok: true, data: { total, page: q.page, pageSize: q.pageSize, items } };
+
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((r) => ({
+          id: r.id,
+          title: r.title,
+          type: r.type,
+          slots: r.slots,
+          country: r.country,
+          hostId: r.hostId,
+          host: r.host,
+          isLocked: r.isLocked,
+          closedAt: r.closedAt?.toISOString() ?? null,
+          status: r.closedAt ? "closed" : "active",
+          participantCount: r._count.participants,
+          openReportCount: r._count.reports,
+          createdAt: r.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/rooms/:id", async (req) => {
+    await requireAdmin(req, "rooms.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const room = await prisma.room.findUnique({
+      where: { id },
+      include: {
+        host: { select: { id: true, displayName: true, avatarUrl: true, country: true, vipLevel: true } },
+        participants: {
+          where: { leftAt: null, kickedAt: null },
+          orderBy: { id: "asc" },
+          include: {
+            user: {
+              select: {
+                id: true, displayName: true, avatarUrl: true, country: true, vipLevel: true,
+                restrictions: { where: { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] }, select: { type: true, expiresAt: true } },
+              },
+            },
+          },
+        },
+        _count: { select: { reports: true, events: true } },
+      },
+    });
+    if (!room) throw notFound("room not found");
+
+    const [openReports, recentEvents] = await Promise.all([
+      prisma.roomReport.findMany({
+        where: { roomId: id, status: { in: ["open", "in_review"] } },
+        orderBy: { id: "desc" },
+        take: 20,
+        include: { room: { select: { id: true, title: true } } },
+      }),
+      prisma.roomEvent.findMany({
+        where: { roomId: id },
+        orderBy: { id: "desc" },
+        take: 30,
+      }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        profile: {
+          id: room.id,
+          title: room.title,
+          type: room.type,
+          slots: room.slots,
+          country: room.country,
+          hostId: room.hostId,
+          host: room.host,
+          isLocked: room.isLocked,
+          livekitRoom: room.livekitRoom,
+          status: room.closedAt ? "closed" : "active",
+          closedAt: room.closedAt?.toISOString() ?? null,
+          createdAt: room.createdAt.toISOString(),
+        },
+        participants: room.participants.map((p) => ({
+          id: p.id,
+          userId: p.user.id,
+          displayName: p.user.displayName,
+          avatarUrl: p.user.avatarUrl,
+          country: p.user.country,
+          vipLevel: p.user.vipLevel,
+          role: p.role,
+          slotIndex: p.slotIndex,
+          muted: p.muted,
+          joinedAt: p.joinedAt.toISOString(),
+          restrictions: p.user.restrictions.map((r) => ({ type: r.type, expiresAt: r.expiresAt?.toISOString() ?? null })),
+          userStatus: p.user.restrictions.some((r) => r.type === "ban") ? "banned"
+            : p.user.restrictions.some((r) => r.type === "mute") ? "muted"
+            : p.user.restrictions.some((r) => r.type === "freeze_wallet") ? "frozen"
+            : p.user.restrictions.length > 0 ? "restricted" : "active",
+        })),
+        participantCount: room.participants.length,
+        openReports: openReports.map((rp) => ({
+          id: rp.id,
+          category: rp.category,
+          description: rp.description,
+          status: rp.status,
+          reporterId: rp.reporterId,
+          reportedUserId: rp.reportedUserId,
+          reviewNote: rp.reviewNote,
+          createdAt: rp.createdAt.toISOString(),
+        })),
+        recentEvents: recentEvents.map((e) => ({
+          id: e.id,
+          type: e.type,
+          userId: e.userId,
+          adminId: e.adminId,
+          details: e.details,
+          createdAt: e.createdAt.toISOString(),
+        })),
+        counts: {
+          reports: room._count.reports,
+          events: room._count.events,
+        },
+      },
+    };
   });
 
   app.post("/v1/admin/rooms/:id/close", async (req) => {
     const admin = await requireAdmin(req, "rooms.write");
     const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({ reason: z.string().trim().min(1).max(300) }), bodyOf(req));
+    const before = await prisma.room.findUnique({ where: { id } });
+    if (!before) throw notFound("room not found");
+    if (before.closedAt) throw badRequest("room is already closed");
     const room = await prisma.room.update({ where: { id }, data: { closedAt: new Date() } });
-    await writeAudit({ adminId: admin.id, req, action: "close_room", entity: "room", entityId: id, after: room });
+    // Record room event + audit.
+    await prisma.roomEvent.create({ data: { roomId: id, type: "closed", adminId: admin.id, details: { reason: input.reason } as never } });
+    await writeAudit({ adminId: admin.id, req, action: "close_room", entity: "room", entityId: id, after: { closedAt: room.closedAt, reason: input.reason } });
+    // Notify connected room participants via socket.io.
+    emitToRoom(id, "room:closed", { roomId: id, reason: input.reason });
+    return { ok: true, data: { id, closedAt: room.closedAt?.toISOString() } };
+  });
+
+  // --- Participant moderation ---------------------------------------------
+  /**
+   * Admin kick — removes a participant from the room by setting kickedAt.
+   * This is the SAME mechanism the host uses via socket.io (room:kick),
+   * but invoked from the admin API. Emits a socket event so connected
+   * participants see the kick in real time.
+   */
+  app.post("/v1/admin/rooms/:id/participants/:userId/kick", async (req) => {
+    const admin = await requireAdmin(req, "rooms.write");
+    const { id, userId } = validate(z.object({ id: z.coerce.number(), userId: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({ reason: z.string().trim().min(1).max(300) }), bodyOf(req));
+    const participant = await prisma.roomParticipant.findUnique({ where: { roomId_userId: { roomId: id, userId } } });
+    if (!participant) throw notFound("participant not found in this room");
+    if (participant.leftAt || participant.kickedAt) throw badRequest("participant has already left or been kicked");
+    await prisma.roomParticipant.update({
+      where: { id: participant.id },
+      data: { kickedAt: new Date(), slotIndex: null },
+    });
+    await prisma.roomEvent.create({ data: { roomId: id, type: "participant_kicked", userId, adminId: admin.id, details: { reason: input.reason } as never } });
+    await writeAudit({ adminId: admin.id, req, action: "kick_participant", entity: "room", entityId: id, after: { userId, reason: input.reason } });
+    emitToRoom(id, "room:kicked", { roomId: id, userId });
     return { ok: true };
+  });
+
+  /**
+   * Admin mute / unmute — toggles the RoomParticipant.muted flag.
+   * Same mechanism as the host's socket.io room:mute event. Emits a socket
+   * event so the participant's client updates the mic state.
+   */
+  app.post("/v1/admin/rooms/:id/participants/:userId/mute", async (req) => {
+    const admin = await requireAdmin(req, "rooms.write");
+    const { id, userId } = validate(z.object({ id: z.coerce.number(), userId: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({ muted: z.boolean(), reason: z.string().trim().max(300).optional() }), bodyOf(req));
+    const participant = await prisma.roomParticipant.findUnique({ where: { roomId_userId: { roomId: id, userId } } });
+    if (!participant) throw notFound("participant not found in this room");
+    if (participant.leftAt || participant.kickedAt) throw badRequest("participant has already left or been kicked");
+    await prisma.roomParticipant.update({
+      where: { id: participant.id },
+      data: { muted: input.muted },
+    });
+    await prisma.roomEvent.create({ data: { roomId: id, type: input.muted ? "participant_muted" : "participant_unmuted", userId, adminId: admin.id, details: { reason: input.reason ?? "" } as never } });
+    await writeAudit({ adminId: admin.id, req, action: input.muted ? "mute_participant" : "unmute_participant", entity: "room", entityId: id, after: { userId, muted: input.muted, reason: input.reason ?? "" } });
+    emitToRoom(id, "room:muted", { roomId: id, userId, muted: input.muted });
+    return { ok: true };
+  });
+
+  // --- Room reports -------------------------------------------------------
+  app.get("/v1/admin/rooms/:id/reports", async (req) => {
+    await requireAdmin(req, "rooms.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const room = await prisma.room.findUnique({ where: { id }, select: { id: true } });
+    if (!room) throw notFound("room not found");
+    const reports = await prisma.roomReport.findMany({
+      where: { roomId: id },
+      orderBy: { id: "desc" },
+      take: 100,
+    });
+    return { ok: true, data: reports };
+  });
+
+  app.post("/v1/admin/rooms/:id/reports", async (req) => {
+    const admin = await requireAdmin(req, "rooms.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(roomReportCreateSchema, bodyOf(req));
+    const room = await prisma.room.findUnique({ where: { id }, select: { id: true, title: true } });
+    if (!room) throw notFound("room not found");
+    const report = await prisma.roomReport.create({
+      data: {
+        roomId: id,
+        reporterId: input.reporterId ?? null,
+        reportedUserId: input.reportedUserId ?? null,
+        category: input.category,
+        description: input.description,
+        reviewerId: admin.id,
+      },
+    });
+    await prisma.roomEvent.create({ data: { roomId: id, type: "report_filed", adminId: admin.id, details: { reportId: report.id, category: input.category } as never } });
+    await writeAudit({ adminId: admin.id, req, action: "file_room_report", entity: "room", entityId: id, after: { reportId: report.id, category: input.category } });
+    return { ok: true, data: { id: report.id, roomId: id, status: report.status } };
+  });
+
+  app.patch("/v1/admin/rooms/:id/reports/:rid", async (req) => {
+    const admin = await requireAdmin(req, "rooms.write");
+    const { id, rid } = validate(z.object({ id: z.coerce.number(), rid: z.coerce.number() }), paramsOf(req));
+    const input = validate(roomReportUpdateSchema, bodyOf(req));
+    const before = await prisma.roomReport.findUnique({ where: { id: rid } });
+    if (!before) throw notFound("report not found");
+    if (before.roomId !== id) throw badRequest("report does not belong to this room");
+    const data: Record<string, unknown> = {};
+    if (input.status) data.status = input.status;
+    if (input.reviewNote !== undefined) data.reviewNote = input.reviewNote;
+    data.reviewerId = admin.id;
+    const after = await prisma.roomReport.update({ where: { id: rid }, data });
+    await prisma.roomEvent.create({ data: { roomId: id, type: "report_resolved", adminId: admin.id, details: { reportId: rid, status: after.status } as never } });
+    await writeAudit({ adminId: admin.id, req, action: "update_room_report", entity: "room", entityId: id, before: { reportId: rid, status: before.status }, after: { reportId: rid, status: after.status, reviewNote: after.reviewNote } });
+    return { ok: true, data: { id: after.id, status: after.status } };
+  });
+
+  // --- Room events --------------------------------------------------------
+  app.get("/v1/admin/rooms/:id/events", async (req) => {
+    await requireAdmin(req, "rooms.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const q = validate(paginationQuery, queryOf(req));
+    const room = await prisma.room.findUnique({ where: { id }, select: { id: true } });
+    if (!room) throw notFound("room not found");
+    const [total, items] = await Promise.all([
+      prisma.roomEvent.count({ where: { roomId: id } }),
+      prisma.roomEvent.findMany({
+        where: { roomId: id },
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((e) => ({
+          id: e.id,
+          type: e.type,
+          userId: e.userId,
+          adminId: e.adminId,
+          details: e.details,
+          createdAt: e.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  // --- Room CSV export ----------------------------------------------------
+  app.get("/v1/admin/rooms/export", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req, reply) => {
+    await requireAdmin(req, "rooms.read");
+    const q = validate(roomListQuerySchema, queryOf(req));
+    const where: Prisma.RoomWhereInput = {};
+    if (q.search) {
+      const asNum = Number(q.search);
+      if (!Number.isNaN(asNum) && Number.isInteger(asNum)) where.id = asNum;
+      else where.OR = [
+        { title: { contains: q.search, mode: "insensitive" } },
+        { host: { displayName: { contains: q.search, mode: "insensitive" } } },
+      ];
+    }
+    if (q.type) where.type = q.type;
+    if (q.status === "active") where.closedAt = null;
+    else if (q.status === "closed") where.closedAt = { not: null };
+    if (q.hostId) where.hostId = q.hostId;
+    const rows = await prisma.room.findMany({
+      where,
+      orderBy: { id: "asc" },
+      take: 5000,
+      include: { host: { select: { displayName: true } }, _count: { select: { participants: true, reports: true } } },
+    });
+    const headers = ["id", "title", "type", "country", "status", "host", "slots", "participantCount", "reportCount", "createdAt", "closedAt"];
+    const escape = (v: unknown): string => {
+      let s = v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+      if (/[",\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const lines = [
+      headers.join(","),
+      ...rows.map((r) => headers.map((h) => {
+        switch (h) {
+          case "id": return escape(r.id);
+          case "title": return escape(r.title);
+          case "type": return escape(r.type);
+          case "country": return escape(r.country);
+          case "status": return escape(r.closedAt ? "closed" : "active");
+          case "host": return escape(r.host?.displayName ?? "");
+          case "slots": return escape(r.slots);
+          case "participantCount": return escape(r._count.participants);
+          case "reportCount": return escape(r._count.reports);
+          case "createdAt": return escape(r.createdAt.toISOString());
+          case "closedAt": return escape(r.closedAt?.toISOString() ?? "");
+          default: return "";
+        }
+      }).join(",")),
+    ];
+    const csv = lines.join("\n");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    reply.header("content-type", "text/csv; charset=utf-8");
+    reply.header("content-disposition", `attachment; filename="rooms-${stamp}.csv"`);
+    reply.header("x-export-row-count", String(rows.length));
+    return csv;
   });
 
   // --- Rounds & bets -------------------------------------------------------

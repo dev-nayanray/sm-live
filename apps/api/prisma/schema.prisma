@@ -194,10 +194,13 @@ model Room {
   closedAt     DateTime?
   host         User              @relation("RoomHost", fields: [hostId], references: [id])
   participants RoomParticipant[]
+  reports      RoomReport[]
+  events       RoomEvent[]
 
   @@index([type])
   @@index([country])
   @@index([hostId])
+  @@index([closedAt])
 }
 
 model RoomParticipant {
@@ -602,6 +605,56 @@ model SecurityEvent {
   createdAt DateTime @default(now())
 
   @@index([createdAt])
+}
+
+/**
+ * Room-level report / complaint. Links a report to a specific room (and
+ * optionally to a reported user within that room). This is separate from the
+ * existing user-level `Complaint` model — room reports carry roomId +
+ * optional reportedUserId context that the user-level complaint lacks.
+ *
+ * Status flow: open → in_review → resolved | dismissed.
+ * Reporter identity is stored but NOT exposed to the reported user or to
+ * admins who lack `rooms.read` permission.
+ */
+model RoomReport {
+  id              Int      @id @default(autoincrement())
+  roomId          Int
+  reporterId      Int?
+  reportedUserId  Int?
+  category        String   @default("other") // harassment | inappropriate_content | spam | impersonation | suspicious | other
+  description     String   @default("")
+  status          String   @default("open") // open | in_review | resolved | dismissed
+  reviewerId      Int?
+  reviewNote      String   @default("")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  room            Room     @relation(fields: [roomId], references: [id])
+
+  @@index([roomId])
+  @@index([status])
+  @@index([category])
+  @@index([createdAt])
+}
+
+/**
+ * Room event timeline — records significant room lifecycle events for the
+ * admin event-history view. Events are append-only (never updated or
+ * deleted). Each event records the actor (userId for user-initiated events,
+ * adminId for admin-initiated events) and a JSON details payload.
+ */
+model RoomEvent {
+  id        Int      @id @default(autoincrement())
+  roomId    Int
+  type      String   // created | closed | participant_joined | participant_left | participant_kicked | participant_muted | participant_unmuted | report_filed | report_resolved | admin_action
+  userId    Int?
+  adminId   Int?
+  details   Json?
+  createdAt DateTime @default(now())
+  room      Room     @relation(fields: [roomId], references: [id])
+
+  @@index([roomId, createdAt])
+  @@index([type])
 }
 
 // ===========================================================================
