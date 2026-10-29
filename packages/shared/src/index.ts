@@ -280,6 +280,70 @@ export function maskContact(s: string | null | undefined): string | null {
   return s.slice(0, 2) + "***" + s.slice(-2);
 }
 
+// ---------------------------------------------------------------------------
+// Agency management (Prompt 04)
+// ---------------------------------------------------------------------------
+//
+// Agencies have an `active` boolean (not a status enum) in the existing
+// schema. We surface it to the UI as a derived status string
+// ("active" | "suspended") so the admin can reason about it without
+// learning the boolean convention. The "pending" state is intentionally
+// NOT invented — there is no approval workflow in the current platform.
+
+export const AGENCY_STATUSES = ["active", "suspended"] as const;
+export type AgencyStatus = (typeof AGENCY_STATUSES)[number];
+
+/**
+ * Create-agency schema. `code` must match the existing unique constraint
+ * format (lowercase alphanumerics + dash/underscore, 2–40 chars). Parent
+ * is optional — top-level agencies have parentId = null.
+ */
+export const agencyCreateSchema = z.object({
+  name: z.string().trim().min(2).max(80),
+  code: z.string().trim().regex(/^[a-z0-9_-]{2,40}$/),
+  description: z.string().trim().max(500).optional(),
+  contactEmail: z.string().trim().email().max(120).optional().or(z.literal("")),
+  contactPhone: z.string().trim().max(40).optional().or(z.literal("")),
+  country: z.string().trim().length(2).optional(),
+  commissionRate: z.coerce.number().min(0).max(1).default(0.1),
+  parentId: z.coerce.number().int().positive().nullable().optional(),
+});
+
+/**
+ * Update-agency schema. All fields optional; same constraints as create.
+ * Status changes go through a dedicated endpoint so we can require a reason.
+ */
+export const agencyUpdateSchema = z.object({
+  name: z.string().trim().min(2).max(80).optional(),
+  description: z.string().trim().max(500).optional(),
+  contactEmail: z.string().trim().email().max(120).optional().or(z.literal("")),
+  contactPhone: z.string().trim().max(40).optional().or(z.literal("")),
+  country: z.string().trim().length(2).optional(),
+  commissionRate: z.coerce.number().min(0).max(1).optional(),
+  parentId: z.coerce.number().int().positive().nullable().optional(),
+});
+
+/**
+ * Status-change schema. `action` is constrained to the two transitions
+ * that make sense for the existing boolean `active` column.
+ */
+export const agencyStatusChangeSchema = z.object({
+  action: z.enum(["activate", "suspend"]),
+  reason: z.string().trim().min(1).max(300),
+});
+
+/**
+ * Agency-list filter schema. Mirrors `userListQuerySchema` so the admin
+ * UI can reuse the same filter-bar pattern.
+ */
+export const agencyListQuerySchema = paginationQuery.extend({
+  status: z.enum(AGENCY_STATUSES).optional(),
+  country: z.string().trim().length(2).optional(),
+  createdFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  createdTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+export type AgencyListQuery = z.infer<typeof agencyListQuerySchema>;
+
 // --- Public app config (response of GET /v1/config/app) ---
 export interface AppConfigGift { id: number; name: string; iconUrl: string; price: number; category: string; animation: string; }
 export interface AppConfigGame { code: string; name: string; thumbnailUrl: string; isPro: boolean; status: string; minBet: number; maxBet: number; }

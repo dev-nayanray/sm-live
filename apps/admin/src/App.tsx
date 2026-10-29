@@ -9,6 +9,8 @@ import { Dashboard } from "./pages/Dashboard";
 import { LiveVoice } from "./pages/LiveVoice";
 import { UsersAgencies } from "./pages/UsersAgencies";
 import { UserDetail } from "./pages/UserDetail";
+import { Agencies } from "./pages/Agencies";
+import { AgencyDetail } from "./pages/AgencyDetail";
 import { Games } from "./pages/Games";
 import { RoundsBets } from "./pages/RoundsBets";
 import { Wallet } from "./pages/Wallet";
@@ -54,6 +56,8 @@ function Shell() {
         <Route path="/live" element={<RequirePerm perm="rooms.read"><LiveVoice /></RequirePerm>} />
         <Route path="/users" element={<RequirePerm perm="users.read"><UsersAgencies /></RequirePerm>} />
         <Route path="/users/:id" element={<RequirePerm perm="users.read"><UserDetail /></RequirePerm>} />
+        <Route path="/agencies" element={<RequirePerm perm="agencies.read"><Agencies /></RequirePerm>} />
+        <Route path="/agencies/:id" element={<RequirePerm perm="agencies.read"><AgencyDetail /></RequirePerm>} />
         <Route path="/games" element={<RequirePerm perm="games.read"><Games /></RequirePerm>} />
         <Route path="/rounds" element={<RequirePerm perm="rounds.read"><RoundsBets /></RequirePerm>} />
         <Route path="/wallet" element={<RequirePerm perm="wallet.read"><Wallet /></RequirePerm>} />

@@ -72,6 +72,13 @@ export const NAV_GROUPS: NavGroup[] = [
         hint: "User accounts, agency onboarding and agency admins (existing page).",
       },
       {
+        to: "/agencies",
+        label: "Agencies",
+        perm: "agencies.read",
+        icon: "users",
+        hint: "Manage agencies, agency admins, member assignments and status.",
+      },
+      {
         to: "/players",
         label: "Players & Restrictions",
         perm: "players.read",

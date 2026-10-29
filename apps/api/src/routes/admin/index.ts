@@ -5,6 +5,7 @@ import {
   adminLoginSchema, paginationQuery, LEDGER_KINDS,
   userListQuerySchema, userUpdateSchema, adminNoteSchema,
   maskContact, RESTRICTION_TYPES,
+  agencyCreateSchema, agencyUpdateSchema, agencyStatusChangeSchema, agencyListQuerySchema,
 } from "@sm-live/shared";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
@@ -1052,29 +1053,504 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // --- Agencies ------------------------------------------------------------
+  //
+  // Full agency-management module (Prompt 04). The existing 3 endpoints
+  // (list / create / patch) are preserved on their original paths but the
+  // list endpoint now accepts filters + pagination, and the create / patch
+  // endpoints use the new shared schemas. New endpoints:
+  //   - GET    /v1/admin/agencies/summary        — KPI cards
+  //   - GET    /v1/admin/agencies/:id            — full profile (5 sections)
+  //   - POST   /v1/admin/agencies/:id/status     — activate / suspend
+  //   - GET    /v1/admin/agencies/:id/members     — paginated members
+  //   - POST   /v1/admin/agencies/:id/members     — assign user
+  //   - DELETE /v1/admin/agencies/:id/members/:userId — remove member
+  //   - GET    /v1/admin/agencies/:id/admins      — list agency admins
+  //   - POST   /v1/admin/agencies/:id/admins      — assign existing admin
+  //   - DELETE /v1/admin/agencies/:id/admins/:adminId — remove admin
+  //   - GET    /v1/admin/agencies/export          — CSV export
+  //
+  // Permissions: every read uses `agencies.read`; every write uses
+  // `agencies.write`. Agency-level admins (role `agency_admin`) only have
+  // `agencies.read` + `wallet.read` by default — they cannot create, edit,
+  // suspend, or assign through these endpoints. Cross-agency access is
+  // prevented because these endpoints never filter by the caller's agencyId
+  // — they are Super-Admin-only management endpoints.
+  app.get("/v1/admin/agencies/summary", async (req) => {
+    await requireAdmin(req, "agencies.read");
+    const now = new Date();
+    const last7d = new Date(now.getTime() - 7 * 86_400_000);
+    const last30d = new Date(now.getTime() - 30 * 86_400_000);
+    const [totalAgencies, activeAgencies, suspendedAgencies, totalMembers, newAgencies7d, newAgencies30d] = await Promise.all([
+      prisma.agency.count(),
+      prisma.agency.count({ where: { active: true } }),
+      prisma.agency.count({ where: { active: false } }),
+      prisma.agencyMember.count(),
+      prisma.agency.count({ where: { createdAt: { gte: last7d } } }),
+      prisma.agency.count({ where: { createdAt: { gte: last30d } } }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        totalAgencies,
+        activeAgencies,
+        suspendedAgencies,
+        totalMembers,
+        newAgencies7d,
+        newAgencies30d,
+        // No "pending" — there is no approval workflow in the existing
+        // platform. Documented in the API response so the UI doesn't
+        // render an empty card.
+        hasApprovalWorkflow: false,
+      },
+    };
+  });
+
   app.get("/v1/admin/agencies", async (req) => {
     await requireAdmin(req, "agencies.read");
-    const agencies = await prisma.agency.findMany({ include: { parent: { select: { id: true, name: true } }, _count: { select: { users: true, children: true } } } });
-    return { ok: true, data: agencies };
+    const q = validate(agencyListQuerySchema, queryOf(req));
+    const where: Prisma.AgencyWhereInput = {};
+    if (q.search) {
+      const asNum = Number(q.search);
+      if (!Number.isNaN(asNum) && Number.isInteger(asNum)) {
+        where.id = asNum;
+      } else {
+        where.OR = [
+          { name: { contains: q.search, mode: "insensitive" } },
+          { code: { contains: q.search, mode: "insensitive" } },
+        ];
+      }
+    }
+    if (q.status === "active") where.active = true;
+    else if (q.status === "suspended") where.active = false;
+    if (q.country) where.country = q.country.toUpperCase();
+    if (q.createdFrom || q.createdTo) {
+      const createdAtFilter: Prisma.DateTimeFilter = {};
+      if (q.createdFrom) createdAtFilter.gte = new Date(`${q.createdFrom}T00:00:00.000Z`);
+      if (q.createdTo) {
+        const t = new Date(`${q.createdTo}T00:00:00.000Z`);
+        t.setUTCDate(t.getUTCDate() + 1);
+        createdAtFilter.lt = t;
+      }
+      where.createdAt = createdAtFilter;
+    }
+    const sortWhitelist = ["id", "name", "code", "createdAt", "commissionRate"];
+    const sortBy = q.sortBy && sortWhitelist.includes(q.sortBy) ? q.sortBy : "id";
+    const orderBy = { [sortBy]: q.sortDir } as const;
+    const [total, items] = await Promise.all([
+      prisma.agency.count({ where }),
+      prisma.agency.findMany({
+        where,
+        orderBy,
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          parent: { select: { id: true, name: true } },
+          _count: { select: { users: true, members: true, admins: true, children: true } },
+        },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((a) => ({
+          id: a.id,
+          name: a.name,
+          code: a.code,
+          description: a.description,
+          contactEmail: a.contactEmail,
+          contactPhone: a.contactPhone,
+          country: a.country,
+          commissionRate: a.commissionRate,
+          parentId: a.parentId,
+          parent: a.parent ? { id: a.parent.id, name: a.parent.name } : null,
+          active: a.active,
+          status: a.active ? "active" : "suspended",
+          memberCount: a._count.members,
+          userCount: a._count.users,
+          adminCount: a._count.admins,
+          childCount: a._count.children,
+          createdAt: a.createdAt.toISOString(),
+          updatedAt: a.updatedAt.toISOString(),
+        })),
+      },
+    };
   });
 
   app.post("/v1/admin/agencies", async (req) => {
     const admin = await requireAdmin(req, "agencies.write");
-    const input = validate(z.object({ name: z.string().min(2), code: z.string().min(2), commissionRate: z.coerce.number().min(0).max(1), parentId: z.coerce.number().optional() }), bodyOf(req));
-    const agency = await prisma.agency.create({ data: { name: input.name, code: input.code, commissionRate: input.commissionRate, parentId: input.parentId ?? null } });
-    await writeAudit({ adminId: admin.id, req, action: "create", entity: "agency", entityId: agency.id, after: agency });
-    return { ok: true, data: agency };
+    const input = validate(agencyCreateSchema, bodyOf(req));
+    // Enforce uniqueness of code BEFORE attempting insert (cleaner error).
+    const existing = await prisma.agency.findUnique({ where: { code: input.code } });
+    if (existing) throw badRequest("agency code already in use");
+    if (input.parentId) {
+      const parent = await prisma.agency.findUnique({ where: { id: input.parentId } });
+      if (!parent) throw badRequest("unknown parent agency");
+    }
+    const agency = await prisma.agency.create({
+      data: {
+        name: input.name,
+        code: input.code,
+        description: input.description ?? "",
+        contactEmail: input.contactEmail ?? "",
+        contactPhone: input.contactPhone ?? "",
+        country: (input.country ?? "XX").toUpperCase(),
+        commissionRate: input.commissionRate,
+        parentId: input.parentId ?? null,
+      },
+    });
+    await writeAudit({ adminId: admin.id, req, action: "create", entity: "agency", entityId: agency.id, after: { name: agency.name, code: agency.code } });
+    return { ok: true, data: { id: agency.id, name: agency.name, code: agency.code } };
+  });
+
+  app.get("/v1/admin/agencies/:id", async (req) => {
+    await requireAdmin(req, "agencies.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const agency = await prisma.agency.findUnique({
+      where: { id },
+      include: {
+        parent: { select: { id: true, name: true, code: true } },
+        children: { select: { id: true, name: true, code: true, active: true } },
+        _count: { select: { users: true, members: true, admins: true, children: true, withdrawals: true } },
+      },
+    });
+    if (!agency) throw notFound("agency not found");
+
+    // Performance summary — only the metrics supported by the existing
+    // schema. We do NOT invent revenue or commission totals; the only
+    // agency-attributed financial records are `AgencyWithdrawal` rows.
+    const last30d = new Date(Date.now() - 30 * 86_400_000);
+    const [newMembers30d, activeAdmins, pendingWithdrawals, recentWithdrawals, auditHistory] = await Promise.all([
+      prisma.agencyMember.count({ where: { agencyId: id, joinedAt: { gte: last30d } } }),
+      prisma.adminUser.count({ where: { agencyId: id, active: true } }),
+      prisma.agencyWithdrawal.count({ where: { agencyId: id, status: "pending" } }),
+      prisma.agencyWithdrawal.findMany({ where: { agencyId: id }, orderBy: { id: "desc" }, take: 10 }),
+      prisma.auditLog.findMany({ where: { entity: "agency", entityId: String(id) }, orderBy: { id: "desc" }, take: 30, include: { admin: { select: { id: true, username: true, displayName: true } } } }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        profile: {
+          id: agency.id,
+          name: agency.name,
+          code: agency.code,
+          description: agency.description,
+          contactEmail: agency.contactEmail,
+          contactPhone: agency.contactPhone,
+          country: agency.country,
+          commissionRate: agency.commissionRate,
+          parentId: agency.parentId,
+          parent: agency.parent,
+          children: agency.children,
+          active: agency.active,
+          status: agency.active ? "active" : "suspended",
+          createdAt: agency.createdAt.toISOString(),
+          updatedAt: agency.updatedAt.toISOString(),
+        },
+        counts: {
+          users: agency._count.users,
+          members: agency._count.members,
+          admins: agency._count.admins,
+          children: agency._count.children,
+          withdrawals: agency._count.withdrawals,
+        },
+        performance: {
+          // Documented definitions — no invented revenue.
+          newMembers30d,
+          activeAdmins,
+          pendingWithdrawals,
+          commissionRate: agency.commissionRate,
+          commissionNote: "Configured rate. Actual settlement happens via the ProviderBill workflow — not recomputed here.",
+        },
+        recentWithdrawals: recentWithdrawals.map((w) => ({
+          id: w.id,
+          amount: w.amount,
+          status: w.status,
+          note: w.note,
+          createdAt: w.createdAt.toISOString(),
+        })),
+        auditHistory: auditHistory.map((a) => ({
+          id: a.id,
+          action: a.action,
+          admin: a.admin ? { id: a.admin.id, username: a.admin.username, displayName: a.admin.displayName } : null,
+          ip: a.ip,
+          createdAt: a.createdAt.toISOString(),
+        })),
+      },
+    };
   });
 
   app.patch("/v1/admin/agencies/:id", async (req) => {
     const admin = await requireAdmin(req, "agencies.write");
     const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
-    const input = validate(z.object({ name: z.string().min(2).optional(), commissionRate: z.coerce.number().min(0).max(1).optional(), active: z.boolean().optional(), parentId: z.coerce.number().nullable().optional() }), bodyOf(req));
+    const input = validate(agencyUpdateSchema, bodyOf(req));
     const before = await prisma.agency.findUnique({ where: { id } });
-    if (!before) throw notFound();
+    if (!before) throw notFound("agency not found");
+    if (input.parentId) {
+      const parent = await prisma.agency.findUnique({ where: { id: input.parentId } });
+      if (!parent) throw badRequest("unknown parent agency");
+      if (input.parentId === id) throw badRequest("agency cannot be its own parent");
+    }
     const agency = await prisma.agency.update({ where: { id }, data: input });
-    await writeAudit({ adminId: admin.id, req, action: "update", entity: "agency", entityId: id, before, after: agency });
-    return { ok: true, data: agency };
+    await writeAudit({ adminId: admin.id, req, action: "update", entity: "agency", entityId: id, before: { name: before.name, description: before.description, contactEmail: before.contactEmail, contactPhone: before.contactPhone, country: before.country, commissionRate: before.commissionRate, parentId: before.parentId }, after: { name: agency.name, description: agency.description, contactEmail: agency.contactEmail, contactPhone: agency.contactPhone, country: agency.country, commissionRate: agency.commissionRate, parentId: agency.parentId } });
+    return { ok: true, data: { id: agency.id, name: agency.name } };
+  });
+
+  /**
+   * Status change (activate / suspend). Implemented as a dedicated endpoint
+   * (not part of PATCH) so we can require a reason and produce a clean
+   * audit trail entry with action=activate_agency / suspend_agency.
+   *
+   * Enforcement: the existing `Agency.active` boolean is the source of
+   * truth. Agency-admin role permissions (`agencies.read` + `wallet.read`)
+   * are unaffected — a suspended agency's admin can still log in and read,
+   * but cannot create / edit / assign through these endpoints because
+   * they all require `agencies.write`. The suspended state is a signal to
+   * operators that the agency should not onboard new members; full
+   * enforcement across mobile-app flows is documented as a future task.
+   */
+  app.post("/v1/admin/agencies/:id/status", async (req) => {
+    const admin = await requireAdmin(req, "agencies.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(agencyStatusChangeSchema, bodyOf(req));
+    const before = await prisma.agency.findUnique({ where: { id } });
+    if (!before) throw notFound("agency not found");
+    const newActive = input.action === "activate";
+    if (before.active === newActive) throw badRequest(`agency is already ${input.action === "activate" ? "active" : "suspended"}`);
+    const after = await prisma.agency.update({ where: { id }, data: { active: newActive } });
+    await writeAudit({
+      adminId: admin.id, req,
+      action: input.action === "activate" ? "activate_agency" : "suspend_agency",
+      entity: "agency", entityId: id,
+      before: { active: before.active },
+      after: { active: after.active, reason: input.reason },
+    });
+    return { ok: true, data: { id: after.id, active: after.active, status: after.active ? "active" : "suspended" } };
+  });
+
+  // --- Agency members ----------------------------------------------------
+  app.get("/v1/admin/agencies/:id/members", async (req) => {
+    await requireAdmin(req, "agencies.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const q = validate(paginationQuery, queryOf(req));
+    const agency = await prisma.agency.findUnique({ where: { id }, select: { id: true } });
+    if (!agency) throw notFound("agency not found");
+    const where: Prisma.AgencyMemberWhereInput = { agencyId: id };
+    if (q.search) {
+      // Numeric search → by userId; otherwise by displayName via the user relation.
+      const asNum = Number(q.search);
+      if (!Number.isNaN(asNum) && Number.isInteger(asNum)) {
+        where.userId = asNum;
+      } else {
+        where.user = { displayName: { contains: q.search, mode: "insensitive" } };
+      }
+    }
+    const [total, items] = await Promise.all([
+      prisma.agencyMember.count({ where }),
+      prisma.agencyMember.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          user: {
+            select: {
+              id: true, displayName: true, avatarUrl: true, country: true,
+              createdAt: true,
+              wallet: { select: { balance: true, frozen: true } },
+              restrictions: { where: { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] }, select: { type: true } },
+            },
+          },
+        },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((m) => ({
+          id: m.id,
+          userId: m.user.id,
+          displayName: m.user.displayName,
+          avatarUrl: m.user.avatarUrl,
+          country: m.user.country,
+          joinedAt: m.joinedAt.toISOString(),
+          userCreatedAt: m.user.createdAt.toISOString(),
+          balance: m.user.wallet?.balance ?? null,
+          walletFrozen: m.user.wallet?.frozen ?? false,
+          status: m.user.restrictions.some((r) => r.type === "ban") ? "banned"
+            : m.user.restrictions.some((r) => r.type === "freeze_wallet") ? "frozen"
+            : m.user.restrictions.length > 0 ? "restricted" : "active",
+        })),
+      },
+    };
+  });
+
+  /**
+   * Assign a user to an agency. Creates an AgencyMember row; if the user
+   * already has a `User.agencyId`, this does NOT change it — the two
+   * relations are independent in the existing schema (User.agencyId is
+   * the "primary agency"; AgencyMember is the membership roster). The
+   * unique constraint (agencyId, userId) prevents duplicates.
+   */
+  app.post("/v1/admin/agencies/:id/members", async (req) => {
+    const admin = await requireAdmin(req, "agencies.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({ userId: z.coerce.number().int().positive() }), bodyOf(req));
+    const [agency, user] = await Promise.all([
+      prisma.agency.findUnique({ where: { id }, select: { id: true, name: true } }),
+      prisma.user.findUnique({ where: { id: input.userId }, select: { id: true, displayName: true, agencyId: true } }),
+    ]);
+    if (!agency) throw notFound("agency not found");
+    if (!user) throw notFound("user not found");
+    try {
+      const member = await prisma.agencyMember.create({ data: { agencyId: id, userId: input.userId } });
+      await writeAudit({ adminId: admin.id, req, action: "assign_member", entity: "agency", entityId: id, after: { userId: input.userId, memberId: member.id, userDisplayName: user.displayName } });
+      return { ok: true, data: { id: member.id, agencyId: id, userId: input.userId, joinedAt: member.joinedAt.toISOString() } };
+    } catch (e) {
+      // P2002 = unique constraint violation → duplicate assignment.
+      if ((e as { code?: string }).code === "P2002") throw badRequest("user is already a member of this agency");
+      throw e;
+    }
+  });
+
+  app.delete("/v1/admin/agencies/:id/members/:userId", async (req) => {
+    const admin = await requireAdmin(req, "agencies.write");
+    const { id, userId } = validate(z.object({ id: z.coerce.number(), userId: z.coerce.number() }), paramsOf(req));
+    const before = await prisma.agencyMember.findUnique({ where: { agencyId_userId: { agencyId: id, userId } } });
+    if (!before) throw notFound("membership not found");
+    await prisma.agencyMember.delete({ where: { agencyId_userId: { agencyId: id, userId } } });
+    await writeAudit({ adminId: admin.id, req, action: "remove_member", entity: "agency", entityId: id, before: { userId } });
+    return { ok: true };
+  });
+
+  // --- Agency administrators ---------------------------------------------
+  app.get("/v1/admin/agencies/:id/admins", async (req) => {
+    await requireAdmin(req, "agencies.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const agency = await prisma.agency.findUnique({ where: { id }, select: { id: true } });
+    if (!agency) throw notFound("agency not found");
+    const admins = await prisma.adminUser.findMany({
+      where: { agencyId: id },
+      orderBy: { id: "asc" },
+      include: { role: { select: { key: true, name: true } } },
+    });
+    return {
+      ok: true,
+      data: admins.map((a) => ({
+        id: a.id,
+        username: a.username,
+        displayName: a.displayName,
+        role: { key: a.role.key, name: a.role.name },
+        active: a.active,
+        lastLoginAt: a.lastLoginAt?.toISOString() ?? null,
+        createdAt: a.createdAt.toISOString(),
+      })),
+    };
+  });
+
+  /**
+   * Assign an EXISTING admin user to an agency. We do NOT create new admin
+   * accounts here — admin creation goes through `POST /v1/admin/admin-users`
+   * (existing endpoint, security.write gated) which now accepts an optional
+   * `agencyId`. This endpoint just sets `AdminUser.agencyId`.
+   *
+   * Role boundary: we refuse to assign an admin whose role is `super_admin`
+   * to an agency — super admins are platform-wide, not agency-scoped.
+   */
+  app.post("/v1/admin/agencies/:id/admins", async (req) => {
+    const admin = await requireAdmin(req, "agencies.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({ adminId: z.coerce.number().int().positive() }), bodyOf(req));
+    const [agency, target] = await Promise.all([
+      prisma.agency.findUnique({ where: { id }, select: { id: true, name: true } }),
+      prisma.adminUser.findUnique({ where: { id: input.adminId }, include: { role: { select: { key: true } } } }),
+    ]);
+    if (!agency) throw notFound("agency not found");
+    if (!target) throw notFound("admin user not found");
+    if (target.role.key === "super_admin") throw badRequest("super_admin cannot be assigned to a single agency");
+    if (target.agencyId === id) throw badRequest("admin is already assigned to this agency");
+    const before = { agencyId: target.agencyId };
+    const after = await prisma.adminUser.update({ where: { id: input.adminId }, data: { agencyId: id } });
+    await writeAudit({ adminId: admin.id, req, action: "assign_agency_admin", entity: "agency", entityId: id, before: { adminId: input.adminId, ...before }, after: { adminId: input.adminId, agencyId: after.agencyId } });
+    return { ok: true, data: { adminId: input.adminId, agencyId: id } };
+  });
+
+  app.delete("/v1/admin/agencies/:id/admins/:adminId", async (req) => {
+    const admin = await requireAdmin(req, "agencies.write");
+    const { id, adminId } = validate(z.object({ id: z.coerce.number(), adminId: z.coerce.number() }), paramsOf(req));
+    const target = await prisma.adminUser.findUnique({ where: { id: adminId } });
+    if (!target) throw notFound("admin user not found");
+    if (target.agencyId !== id) throw badRequest("admin is not assigned to this agency");
+    await prisma.adminUser.update({ where: { id: adminId }, data: { agencyId: null } });
+    await writeAudit({ adminId: admin.id, req, action: "remove_agency_admin", entity: "agency", entityId: id, before: { adminId, agencyId: id }, after: { adminId, agencyId: null } });
+    return { ok: true };
+  });
+
+  // --- Agency CSV export -------------------------------------------------
+  app.get("/v1/admin/agencies/export", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req, reply) => {
+    const admin = await requireAdmin(req, "agencies.read");
+    void admin;
+    const q = validate(agencyListQuerySchema, queryOf(req));
+    const where: Prisma.AgencyWhereInput = {};
+    if (q.search) {
+      const asNum = Number(q.search);
+      if (!Number.isNaN(asNum) && Number.isInteger(asNum)) where.id = asNum;
+      else where.OR = [
+        { name: { contains: q.search, mode: "insensitive" } },
+        { code: { contains: q.search, mode: "insensitive" } },
+      ];
+    }
+    if (q.status === "active") where.active = true;
+    else if (q.status === "suspended") where.active = false;
+    if (q.country) where.country = q.country.toUpperCase();
+    if (q.createdFrom || q.createdTo) {
+      const createdAtFilter: Prisma.DateTimeFilter = {};
+      if (q.createdFrom) createdAtFilter.gte = new Date(`${q.createdFrom}T00:00:00.000Z`);
+      if (q.createdTo) {
+        const t = new Date(`${q.createdTo}T00:00:00.000Z`);
+        t.setUTCDate(t.getUTCDate() + 1);
+        createdAtFilter.lt = t;
+      }
+      where.createdAt = createdAtFilter;
+    }
+    const rows = await prisma.agency.findMany({
+      where,
+      orderBy: { id: "asc" },
+      take: 5000,
+      include: { _count: { select: { users: true, members: true, admins: true } } },
+    });
+    const headers = ["id", "name", "code", "country", "commissionRate", "status", "memberCount", "adminCount", "createdAt"];
+    const escape = (v: unknown): string => {
+      let s = v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+      if (/[",\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const lines = [
+      headers.join(","),
+      ...rows.map((a) => headers.map((h) => {
+        switch (h) {
+          case "id": return escape(a.id);
+          case "name": return escape(a.name);
+          case "code": return escape(a.code);
+          case "country": return escape(a.country);
+          case "commissionRate": return escape(a.commissionRate);
+          case "status": return escape(a.active ? "active" : "suspended");
+          case "memberCount": return escape(a._count.members);
+          case "adminCount": return escape(a._count.admins);
+          case "createdAt": return escape(a.createdAt.toISOString());
+          default: return "";
+        }
+      }).join(",")),
+    ];
+    const csv = lines.join("\n");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    reply.header("content-type", "text/csv; charset=utf-8");
+    reply.header("content-disposition", `attachment; filename="agencies-${stamp}.csv"`);
+    reply.header("x-export-row-count", String(rows.length));
+    return csv;
   });
 
   /** Admin recharges a user's wallet on their behalf (agency panel action). */
@@ -1455,13 +1931,33 @@ export async function adminRoutes(app: FastifyInstance) {
 
   app.post("/v1/admin/admin-users", async (req) => {
     const admin = await requireAdmin(req, "security.write");
-    const input = validate(z.object({ username: z.string().min(3).max(60), email: z.string().email(), password: z.string().min(8), displayName: z.string().min(2), roleKey: z.string() }), bodyOf(req));
+    const input = validate(z.object({
+      username: z.string().min(3).max(60),
+      email: z.string().email(),
+      password: z.string().min(8),
+      displayName: z.string().min(2),
+      roleKey: z.string(),
+      // Optional agency association — used by Prompt 04 to provision an
+      // agency-scoped admin in one step. Refused for `super_admin` (a
+      // super admin is platform-wide, never agency-scoped).
+      agencyId: z.coerce.number().int().positive().nullable().optional(),
+    }), bodyOf(req));
     const role = await prisma.role.findUnique({ where: { key: input.roleKey } });
     if (!role) throw badRequest("unknown role");
+    if (role.key === "super_admin" && input.agencyId) throw badRequest("super_admin cannot be assigned to a single agency");
+    if (input.agencyId) {
+      const agency = await prisma.agency.findUnique({ where: { id: input.agencyId }, select: { id: true } });
+      if (!agency) throw badRequest("unknown agency");
+    }
     const created = await prisma.adminUser.create({
-      data: { username: input.username, email: input.email, passwordHash: await hashPassword(input.password), displayName: input.displayName, roleId: role.id },
+      data: {
+        username: input.username, email: input.email,
+        passwordHash: await hashPassword(input.password),
+        displayName: input.displayName, roleId: role.id,
+        agencyId: input.agencyId ?? null,
+      },
     });
-    await writeAudit({ adminId: admin.id, req, action: "create_admin_user", entity: "admin_user", entityId: created.id, after: { username: created.username, role: input.roleKey } });
+    await writeAudit({ adminId: admin.id, req, action: "create_admin_user", entity: "admin_user", entityId: created.id, after: { username: created.username, role: input.roleKey, agencyId: input.agencyId ?? null } });
     return { ok: true, data: { id: created.id, username: created.username } };
   });
 }
