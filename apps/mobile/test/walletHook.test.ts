@@ -1,6 +1,6 @@
 import { latestBalance, netCoins, type LedgerItemView } from "../src/hooks/walletPure";
 
-function item(amount: number, balanceAfter: number): LedgerItem {
+function item(amount: number, balanceAfter: number): LedgerItemView {
   return { id: String(balanceAfter), kind: "recharge", amount, balanceAfter, txKey: `t:${balanceAfter}`, createdAt: new Date().toISOString() };
 }
 
