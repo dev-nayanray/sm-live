@@ -94,7 +94,7 @@ export async function adminResourceRoutes(app: FastifyInstance) {
     };
   });
 
-  app.get("/v1/admin/resources/:resource", async (req, reply) => {
+  app.get("/v1/admin/resources/:resource", async (req) => {
     const { resource } = req.params as { resource: string };
     const def = RESOURCES[resource];
     if (!def) throw notFound(`unknown resource ${resource}`);

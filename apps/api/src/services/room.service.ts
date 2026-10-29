@@ -1,5 +1,5 @@
 import { env } from "../env.js";
-import { notFound, badRequest, forbidden } from "../lib/errors.js";
+import { notFound, badRequest } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import type { Room } from "@prisma/client";
 

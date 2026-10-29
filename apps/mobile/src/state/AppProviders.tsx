@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { api, tokenStore } from "../api/client";
+import { API_BASE } from "../api/env";
 import { DEFAULT_CONFIG, fetchAppConfig, loadConfig, type AppConfigResponse } from "../api/config";
 
 // --- auth -------------------------------------------------------------------
@@ -50,7 +51,7 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
     loggedIn: !!user,
     user,
     login: async (identifier, password) => {
-      const res = await fetch(`${API_BASE_REF()}/v1/auth/login`, {
+      const res = await fetch(`${API_BASE}/v1/auth/login`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ identifier, password }),
@@ -62,7 +63,7 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
       setUser(me.user);
     },
     register: async (args) => {
-      const res = await fetch(`${API_BASE_REF()}/v1/auth/register`, {
+      const res = await fetch(`${API_BASE}/v1/auth/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ ...args, market: marketRef.code }),
@@ -74,7 +75,7 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
       setUser(me.user);
     },
     otpLogin: async (identifier, code) => {
-      const res = await fetch(`${API_BASE_REF()}/v1/auth/otp/verify`, {
+      const res = await fetch(`${API_BASE}/v1/auth/otp/verify`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ identifier, code }),
@@ -131,14 +132,8 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
   );
 }
 
-// small indirection so auth closures always use current market
+// small indirection so auth closures always register with the current market
 const marketRef = { code: "default" };
-function API_BASE_REF(): string {
-  // avoid circular import: read from env module lazily
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { API_BASE } = require("../api/env");
-  return API_BASE;
-}
 
 export const useAuth = () => useContext(AuthCtx);
 export const useAppConfig = () => useContext(ConfigCtx);

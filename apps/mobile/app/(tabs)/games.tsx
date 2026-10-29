@@ -1,7 +1,6 @@
 import { router } from "expo-router";
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
-import { useCallback, useEffect, useState } from "react";
-import { api } from "../../src/api/client";
+import { useCallback, useState } from "react";
 import { useAppConfig } from "../../src/state/AppProviders";
 
 /** Games list straight from GET /v1/config/app — no hard-coded entries. */

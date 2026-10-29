@@ -1,7 +1,6 @@
 import { StyleSheet, Text, View, FlatList, TextInput, Pressable } from "react-native";
 import { useEffect, useState } from "react";
 import { io, type Socket } from "socket.io-client";
-import { api } from "../../src/api/client";
 import { tokenStore } from "../../src/api/client";
 import { API_BASE } from "../../src/api/env";
 import { useAuth } from "../../src/state/AppProviders";

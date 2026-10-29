@@ -57,7 +57,7 @@ export class ConfigService {
   private async buildAppConfig(marketCode: string): Promise<AppConfigResponse> {
     const [market] = await this.db.market.findMany({ where: { code: marketCode, enabled: true }, take: 1 });
     const effectiveMarket = market ?? (await this.db.market.findFirst({ where: { code: "default" } }));
-    const [brand, flags, gifts, games, countryFilters] = await Promise.all([
+    const [brand, flags, gifts, games] = await Promise.all([
       effectiveMarket
         ? this.db.brandConfig.findUnique({ where: { marketId: effectiveMarket.id } })
         : Promise.resolve(null),
@@ -70,7 +70,6 @@ export class ConfigService {
             orderBy: { sortOrder: "asc" },
           })
         : Promise.resolve([]),
-      effectiveMarket ? this.db.countryFilter.findMany({ where: { marketId: effectiveMarket.id } }) : Promise.resolve([]),
     ]);
 
     const appGames: AppConfigGame[] = games.map((g) => {

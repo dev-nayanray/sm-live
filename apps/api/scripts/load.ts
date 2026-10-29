@@ -37,7 +37,6 @@ async function main() {
     body: JSON.stringify({ phone, password: "Load123!", displayName: "Load Tester" }),
   });
   const token = reg.json.data?.accessToken ?? reg.json.accessToken;
-  const userId = reg.json.data?.user?.id ?? reg.json.user?.id;
   await api("/v1/wallet/recharge", {
     method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     body: JSON.stringify({ amount: 25_000, provider: "fake" }),

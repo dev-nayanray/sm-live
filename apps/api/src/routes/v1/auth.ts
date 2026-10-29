@@ -13,7 +13,7 @@ import { recordSecurityEvent } from "../../lib/audit.js";
  */
 const DEV_OTP = "123456";
 
-async function deliverOtp(identifier: string): Promise<string> {
+async function deliverOtp(_identifier: string): Promise<string> {
   return DEV_OTP; // stub — production: send via SMS/email gateway
 }
 

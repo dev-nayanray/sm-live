@@ -2,13 +2,13 @@ import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { adminLoginSchema, paginationQuery } from "@sm-live/shared";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { unauthorized, notFound, badRequest, forbidden } from "../../lib/errors.js";
 import { validate, bodyOf, paramsOf, queryOf } from "../../lib/validate.js";
 import { requireAdmin, signAdminToken, verifyPassword, hashPassword } from "../../lib/auth.js";
 import { writeAudit, recordApiError } from "../../lib/audit.js";
 import { postLedgerEntries, ledgerIntegrityCheck } from "../../services/ledger.service.js";
-import { configService } from "../../services/config.service.js";
 import { getPaymentAdapter } from "../../services/payment.adapter.js";
 import os from "node:os";
 
@@ -385,8 +385,9 @@ export async function adminRoutes(app: FastifyInstance) {
   app.get("/v1/admin/reports/revenue", async (req) => {
     await requireAdmin(req, "reports.read");
     const granularity = ((req.query as { granularity?: string }).granularity ?? "daily") as "daily" | "weekly" | "monthly";
+    const unit = granularity === "weekly" ? "week" : granularity === "monthly" ? "month" : "day";
     const rows = await prisma.$queryRaw<{ bucket: Date; bets: bigint; wins: bigint; rounds: bigint; revenue: bigint }[]>`
-      SELECT date_trunc(${granularity}, b."createdAt") AS bucket,
+      SELECT date_trunc(${Prisma.raw(`'${unit}'`)}, b."createdAt") AS bucket,
              COALESCE(SUM(b.amount),0) AS bets,
              0 AS wins,
              COUNT(DISTINCT b."roundId") AS rounds,
@@ -394,7 +395,7 @@ export async function adminRoutes(app: FastifyInstance) {
       FROM "Bet" b GROUP BY bucket ORDER BY bucket DESC LIMIT 90`;
     // wins per bucket
     const wins = await prisma.$queryRaw<{ bucket: Date; wins: bigint }[]>`
-      SELECT date_trunc(${granularity}, p."createdAt") AS bucket, COALESCE(SUM(p.amount),0) AS wins
+      SELECT date_trunc(${Prisma.raw(`'${unit}'`)}, p."createdAt") AS bucket, COALESCE(SUM(p.amount),0) AS wins
       FROM "Payout" p GROUP BY bucket`;
     const winsMap = new Map(wins.map((w) => [new Date(w.bucket).toISOString().slice(0, 13), Number(w.wins)]));
     const data = rows.map((r) => {

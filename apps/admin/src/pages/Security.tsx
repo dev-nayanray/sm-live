@@ -10,7 +10,6 @@ interface ApiErr { id: number; source: string; route: string; message: string; c
 interface SecEvent { id: number; kind: string; message: string; ip: string; createdAt: string }
 interface ServerStatus { uptimeSeconds: number; nodeVersion: string; platform: string; memoryMb: number; heapMb: number; pid: number; time: string }
 interface Role { id: number; key: string; name: string; permissions: { permission: { key: string } }[] }
-interface RApiErr { id: number; userId: number | null; kind: string; severity: string; message: string; createdAt: string }
 
 export function Security() {
   const [tab, setTab] = useState<"keys" | "errors" | "events" | "audit" | "status" | "roles">("keys");

@@ -1,0 +1,43 @@
+# Overlay for production: restart policies, resource limits, no host ports
+# for datastores. Use: docker compose -f infra/docker-compose.yml -f infra/docker-compose.prod.yml up -d
+services:
+  postgres:
+    restart: unless-stopped
+    ports: !override []
+    deploy:
+      resources:
+        limits: { memory: 1g }
+
+  redis:
+    restart: unless-stopped
+    ports: !override []
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    deploy:
+      resources:
+        limits: { memory: 768m }
+
+  livekit:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { memory: 2g }
+
+  api:
+    restart: unless-stopped
+    env_file: [../infra/.env]
+    deploy:
+      resources:
+        limits: { memory: 1g }
+
+  provider-mock:
+    restart: unless-stopped
+    env_file: [../infra/.env]
+    deploy:
+      resources:
+        limits: { memory: 384m }
+
+  admin:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { memory: 256m }

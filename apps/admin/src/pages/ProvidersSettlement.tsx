@@ -3,7 +3,6 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "../api";
 import { useAuth } from "../auth";
 import { Badge, Button, Card, Empty, Loading } from "../components/ui";
-import { ResourceTable } from "../components/Resource";
 
 interface Bill { id: number; providerId: number; periodStart: string; periodEnd: string; grossBets: number; grossPayout: number; commissionPct: number; commissionAmount: number; serviceFee: number; netPayable: number; status: string; provider: { name: string } }
 interface SRec { id: number; providerId: number; amount: number; direction: string; method: string; note: string; createdAt: string; provider: { name: string } }

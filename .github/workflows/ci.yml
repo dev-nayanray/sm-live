@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sm_live
+          POSTGRES_PASSWORD: sm_live
+          POSTGRES_DB: sm_live
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sm_live" --health-interval 5s
+          --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://sm_live:sm_live@localhost:5432/sm_live?schema=public
+      REDIS_URL: redis://localhost:6379
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm approve-builds <<< $'a\ny' || true
+      - run: pnpm build:shared
+      - run: pnpm -F @sm-live/api prisma:generate
+      - run: pnpm -F @sm-live/api exec prisma migrate deploy
+      - run: pnpm -F @sm-live/api prisma:seed
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: e2e flow
+        run: |
+          pnpm -F @sm-live/api dev & sleep 12
+          pnpm test:flow
+        env:
+          FLOW_API_BASE: http://localhost:4001
+      - name: admin smoke (playwright)
+        run: |
+          pnpm -F @sm-live/api dev & sleep 12
+          pnpm -F @sm-live/admin dev & sleep 8
+          pnpm -F @sm-live/admin exec playwright install --with-deps chromium
+          pnpm -F @sm-live/admin exec playwright test
+        env:
+          ADMIN_URL: http://localhost:5173

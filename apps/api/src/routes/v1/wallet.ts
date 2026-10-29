@@ -1,8 +1,6 @@
 import type { FastifyInstance } from "fastify";
-import { z } from "zod";
 import { rechargeSchema } from "@sm-live/shared";
 import { prisma } from "../../lib/prisma.js";
-import { notFound, badRequest } from "../../lib/errors.js";
 import { validate, bodyOf, queryOf } from "../../lib/validate.js";
 import { requireUser } from "../../lib/auth.js";
 import { credit } from "../../services/ledger.service.js";

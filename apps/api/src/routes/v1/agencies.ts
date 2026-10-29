@@ -1,10 +1,7 @@
 import type { FastifyInstance } from "fastify";
-import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { forbidden, notFound } from "../../lib/errors.js";
-import { validate, bodyOf, paramsOf } from "../../lib/validate.js";
 import { requireUser } from "../../lib/auth.js";
-import { requireAdmin } from "../../lib/auth.js";
 
 export async function agencyRoutes(app: FastifyInstance) {
   /** Public-ish: agency tree for the calling user (agency members see their subtree). */

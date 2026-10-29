@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { providerBetSchema, providerRoundWebhookSchema, providerWinSchema } from "@sm-live/shared";
 import { prisma } from "../lib/prisma.js";
-import { AppError, notFound, badRequest, unauthorized } from "../lib/errors.js";
+import { notFound, badRequest, unauthorized } from "../lib/errors.js";
 import { validate } from "../lib/validate.js";
 import { verifyProviderSignature } from "../lib/hmac.js";
 import { postLedgerEntries, balanceOf } from "../services/ledger.service.js";
