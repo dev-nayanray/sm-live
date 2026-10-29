@@ -12,24 +12,47 @@ test.describe("admin smoke", () => {
     await page.locator("input[type=password]").fill("SuperAdmin123!");
     await page.getByRole("button", { name: /sign in/i }).click();
 
-    // dashboard
+    // Dashboard (Prompt 02)
     await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText("Active rooms")).toBeVisible();
-    await expect(page.getByText("Revenue (bets−wins)")).toBeVisible();
+    await expect(page.getByText("Monitor platform activity, financial operations, and system health.")).toBeVisible();
 
-    // games page (config-driven table)
-    await page.getByRole("link", { name: "Games" }).click();
+    for (const kpi of [
+      "Total users",
+      "Active users",
+      "Total agencies",
+      "Live rooms",
+      "Games",
+      "Wallet transactions",
+      "Providers",
+      "Net gaming margin",
+    ]) {
+      await expect(page.getByText(kpi).first()).toBeVisible();
+    }
+
+    await expect(page.getByText("Platform activity").first()).toBeVisible();
+    await expect(page.getByText("Financial summary").first()).toBeVisible();
+    await expect(page.getByText("Recent platform activity").first()).toBeVisible();
+    await expect(page.getByText("Operational alerts").first()).toBeVisible();
+    await expect(page.getByText("Quick actions").first()).toBeVisible();
+    await expect(page.getByText(/All amounts in coins/).first()).toBeVisible();
+
+    await page.getByRole("button", { name: "Today" }).click();
+    await expect(page.getByText("Today", { exact: false }).first()).toBeVisible();
+
+    // Existing pages still work (regression check) — navigate directly
+    // (the sidebar links are inside collapsible groups, so direct URL
+    // navigation is the most reliable test path).
+    await page.goto(ADMIN_URL + "/#/games");
+    await page.goto(ADMIN_URL + "/games");
     await expect(page.getByRole("heading", { name: "Games", exact: true })).toBeVisible();
     await expect(page.getByText("crash-x").first()).toBeVisible();
 
-    // wallet ledger explorer
-    await page.getByRole("link", { name: "Wallet" }).click();
+    await page.goto(ADMIN_URL + "/wallet");
     await expect(page.getByRole("heading", { name: "Wallet", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Ledger explorer" }).click();
     await expect(page.getByText("Ledger explorer").first()).toBeVisible();
 
-    // settings — live config preview
-    await page.getByRole("link", { name: "Settings" }).click();
+    await page.goto(ADMIN_URL + "/settings");
     await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Live app config" }).click();
     await expect(page.getByText("SM Live").first()).toBeVisible();
@@ -41,7 +64,6 @@ test.describe("admin smoke", () => {
     await page.locator("input[type=password]").fill("Viewer123!");
     await page.getByRole("button", { name: /sign in/i }).click();
 
-    // viewer has zero permissions → no nav entries, no write buttons anywhere
     await page.waitForTimeout(2500);
     const navLinks = await page.locator("aside nav a").count();
     expect(navLinks).toBe(0);

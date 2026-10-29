@@ -108,3 +108,31 @@ export function useTheme() {
   }, [dark]);
   return { dark, toggle: () => setDark((d) => !d) };
 }
+
+/**
+ * Lightweight skeleton placeholder used by loading states throughout the
+ * admin (added in Prompt 02 — Dashboard). Matches the rounded-card aesthetic
+ * of the existing Card component so the loading layout doesn't jump.
+ */
+export function Skeleton({ className = "" }: { className?: string }) {
+  return <div className={`animate-pulse rounded-md bg-slate-200/70 dark:bg-slate-700/50 ${className}`} aria-hidden="true" />;
+}
+
+/**
+ * Inline retry control used by error states. Accepts an optional label so it
+ * can be reused on any dashboard sub-section.
+ */
+export function Retry({ onRetry, label = "Retry" }: { onRetry: () => void; label?: string }) {
+  return (
+    <div className="flex flex-col items-center gap-2 py-6 text-center">
+      <p className="text-sm text-slate-500 dark:text-slate-400">Something went wrong loading this section.</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="rounded-lg bg-violet-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-violet-700"
+      >
+        {label}
+      </button>
+    </div>
+  );
+}

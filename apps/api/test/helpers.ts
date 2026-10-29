@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { providerRoutes } from "../src/routes/provider.js";
 import { adminResourceRoutes } from "../src/routes/admin/resources.js";
+import { adminRoutes } from "../src/routes/admin/index.js";
 import { setErrorHandler } from "../src/lib/errors.js";
 
 export async function buildTestApp(): Promise<FastifyInstance> {
@@ -16,6 +17,7 @@ export async function buildTestApp(): Promise<FastifyInstance> {
   app.setErrorHandler((err, _req, reply) => setErrorHandler(reply, err));
   await app.register(providerRoutes);
   await app.register(adminResourceRoutes);
+  await app.register(adminRoutes);
   await app.ready();
   return app;
 }

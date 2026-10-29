@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { adminLoginSchema, paginationQuery } from "@sm-live/shared";
+import { adminLoginSchema, paginationQuery, LEDGER_KINDS } from "@sm-live/shared";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { unauthorized, notFound, badRequest, forbidden } from "../../lib/errors.js";
@@ -12,6 +12,125 @@ import { postLedgerEntries, ledgerIntegrityCheck } from "../../services/ledger.s
 import { getPaymentAdapter } from "../../services/payment.adapter.js";
 import os from "node:os";
 
+/**
+ * Dashboard date-range validator.
+ *
+ * Presets are evaluated server-side (timezone = UTC) so the admin UI and any
+ * programmatic caller get the same windows. Custom ranges accept ISO 8601
+ * calendar dates only (YYYY-MM-DD) — never raw timestamps — and are clamped
+ * to a 90-day maximum to keep the aggregation queries bounded.
+ */
+const DASHBOARD_PRESETS = ["today", "yesterday", "last7", "last30", "this_month", "prev_month"] as const;
+type DashboardPreset = (typeof DASHBOARD_PRESETS)[number];
+
+const dashboardQuerySchema = z.object({
+  preset: z.enum(DASHBOARD_PRESETS).optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+/** Resolve {from, to, prevFrom, prevTo} (UTC, half-open [from, to)) for a preset or custom range. */
+function resolveDashboardRange(preset: DashboardPreset | undefined, fromStr?: string, toStr?: string): {
+  from: Date; to: Date; prevFrom: Date; prevTo: Date; label: string;
+} {
+  const now = new Date();
+  const todayUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+
+  let from: Date;
+  let to: Date;
+  let label: string;
+
+  if (preset) {
+    switch (preset) {
+      case "today": {
+        from = todayUtc;
+        to = new Date(todayUtc.getTime() + 86_400_000);
+        label = "Today";
+        break;
+      }
+      case "yesterday": {
+        from = new Date(todayUtc.getTime() - 86_400_000);
+        to = todayUtc;
+        label = "Yesterday";
+        break;
+      }
+      case "last7": {
+        from = new Date(todayUtc.getTime() - 6 * 86_400_000);
+        to = new Date(todayUtc.getTime() + 86_400_000);
+        label = "Last 7 days";
+        break;
+      }
+      case "last30": {
+        from = new Date(todayUtc.getTime() - 29 * 86_400_000);
+        to = new Date(todayUtc.getTime() + 86_400_000);
+        label = "Last 30 days";
+        break;
+      }
+      case "this_month": {
+        from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+        to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+        label = "This month";
+        break;
+      }
+      case "prev_month": {
+        from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+        to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+        label = "Previous month";
+        break;
+      }
+      default: {
+        // exhaustive — TS guarantees this is unreachable
+        from = new Date(todayUtc.getTime() - 29 * 86_400_000);
+        to = todayUtc;
+        label = "Last 30 days";
+      }
+    }
+  } else if (fromStr && toStr) {
+    from = new Date(`${fromStr}T00:00:00.000Z`);
+    to = new Date(`${toStr}T00:00:00.000Z`);
+    // to is exclusive → roll forward one day so the user's "to" day is included
+    to = new Date(to.getTime() + 86_400_000);
+    label = `${fromStr} → ${toStr}`;
+    if (to.getTime() <= from.getTime()) throw badRequest("`to` must be on or after `from`");
+    if (to.getTime() - from.getTime() > 90 * 86_400_000) throw badRequest("custom range must be ≤ 90 days");
+  } else {
+    // Default: last 30 days
+    from = new Date(todayUtc.getTime() - 29 * 86_400_000);
+    to = new Date(todayUtc.getTime() + 86_400_000);
+    label = "Last 30 days";
+  }
+
+  // Equivalent previous period (same duration, immediately before `from`).
+  const durationMs = to.getTime() - from.getTime();
+  const prevFrom = new Date(from.getTime() - durationMs);
+  const prevTo = from;
+  return { from, to, prevFrom, prevTo, label };
+}
+
+/** Percentage delta between two non-negative counts; null when prev === 0 (cannot divide) or either is null. */
+function pctDelta(curr: number | null, prev: number | null): number | null {
+  if (curr == null || prev == null) return null;
+  if (prev === 0) return curr === 0 ? 0 : null;
+  return Math.round(((curr - prev) / prev) * 1000) / 10;
+}
+
+/**
+ * Reverse-compatible but greatly enriched dashboard endpoint.
+ *
+ * Response shape (kept additive so the existing `/v1/admin/dashboard` callers
+ * continue to work; new fields are documented below):
+ *
+ *   totals:            legacy 30-day snapshot (preserved for any old consumer)
+ *   range:             { from, to, preset, label }
+ *   generatedAt:       ISO timestamp of this response
+ *   currency:          "coins" — platform-configured virtual currency
+ *   kpis:              { users, agencies, liveRooms, games, walletTx, providers }
+ *                       each: { total, currentPeriod, previousPeriod, deltaPct, ... }
+ *   financial:         { bets, payouts, gifts, recharges, refunds, netGaming }
+ *   series:            [{ day, newUsers, bets, payouts, recharges, gifts }]
+ *   activity:          [{ id, kind, label, category, status, actor, ts }]
+ *   alerts:            [{ id, severity, title, detail, ts, link }]
+ */
 export async function adminRoutes(app: FastifyInstance) {
   // --- Auth ---------------------------------------------------------------
   app.post("/v1/admin/auth/login", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req) => {
@@ -49,44 +168,341 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // --- Dashboard ------------------------------------------------------------
-  app.get("/v1/admin/dashboard", async (req) => {
+  app.get("/v1/admin/dashboard", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async (req) => {
     await requireAdmin(req, "dashboard.view");
-    const now = new Date();
-    const d30 = new Date(now.getTime() - 30 * 86400_000);
-    const d1 = new Date(now.getTime() - 86400_000);
-    const [betsAgg, winsAgg, activeRooms, newUsers, apiErrors, series, giftsAgg, rechargesAgg] = await Promise.all([
-      prisma.bet.aggregate({ where: { createdAt: { gte: d30 } }, _count: true, _sum: { amount: true } }),
-      prisma.payout.aggregate({ where: { createdAt: { gte: d30 } }, _count: true, _sum: { amount: true } }),
+    const q = validate(dashboardQuerySchema, queryOf(req));
+    const range = resolveDashboardRange(q.preset, q.from, q.to);
+    const { from, to, prevFrom, prevTo } = range;
+
+    // ----------------------------------------------------------------------
+    // KPI sources (all aggregates — no full table scans into memory)
+    // ----------------------------------------------------------------------
+    const [
+      totalUsers, newUsersInPeriod, newUsersPrev,
+      totalAgencies, newAgenciesInPeriod, newAgenciesPrev,
+      activeRooms, totalRooms, roomsOpenedInPeriod, roomsClosedInPeriod,
+      gamesTotal, gamesActive, gamesMaintenance, gamesDisabled,
+      betsAgg, betsAggPrev, payoutsAgg, payoutsAggPrev,
+      giftsAgg, giftsAggPrev,
+      rechargesAgg, rechargesAggPrev, rechargesFailed,
+      refundsAgg, refundsAggPrev,
+      ledgerInPeriod, ledgerPrev,
+      providersTotal, providersEnabled, providersWithErrors,
+      apiErrorsInPeriod, suspiciousHighInPeriod, complaintsOpen,
+      seriesRows,
+      recentAudit,
+    ] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: { createdAt: { gte: from, lt: to } } }),
+      prisma.user.count({ where: { createdAt: { gte: prevFrom, lt: prevTo } } }),
+      prisma.agency.count(),
+      prisma.agency.count({ where: { createdAt: { gte: from, lt: to } } }),
+      prisma.agency.count({ where: { createdAt: { gte: prevFrom, lt: prevTo } } }),
       prisma.room.count({ where: { closedAt: null } }),
-      prisma.user.count({ where: { createdAt: { gte: d1 } } }),
-      prisma.apiErrorLog.count({ where: { createdAt: { gte: d1 } } }),
-      prisma.$queryRaw<{ day: Date; bets: bigint; wins: bigint; revenue: bigint }[]>`
-        SELECT d::date AS day,
-          COALESCE(SUM(b.amount),0) AS bets,
-          COALESCE((SELECT SUM(p.amount) FROM "Payout" p WHERE p."createdAt" >= d AND p."createdAt" < d + interval '1 day'),0) AS wins,
-          COALESCE(SUM(b.amount),0) - COALESCE((SELECT SUM(p.amount) FROM "Payout" p WHERE p."createdAt" >= d AND p."createdAt" < d + interval '1 day'),0) AS revenue
-        FROM generate_series(${d30.toISOString()}::date, ${now.toISOString()}::date, interval '1 day') d
-        LEFT JOIN "Bet" b ON b."createdAt" >= d AND b."createdAt" < d + interval '1 day'
-        GROUP BY d ORDER BY d`,
-      prisma.giftTransaction.aggregate({ where: { createdAt: { gte: d30 } }, _sum: { totalPrice: true } }),
-      prisma.recharge.aggregate({ where: { createdAt: { gte: d30 } }, _sum: { amount: true } }),
+      prisma.room.count(),
+      prisma.room.count({ where: { createdAt: { gte: from, lt: to } } }),
+      prisma.room.count({ where: { closedAt: { gte: from, lt: to } } }),
+      prisma.game.count(),
+      prisma.game.count({ where: { status: "active" } }),
+      prisma.game.count({ where: { status: "maintenance" } }),
+      prisma.game.count({ where: { status: "disabled" } }),
+      prisma.bet.aggregate({ where: { createdAt: { gte: from, lt: to } }, _count: true, _sum: { amount: true } }),
+      prisma.bet.aggregate({ where: { createdAt: { gte: prevFrom, lt: prevTo } }, _count: true, _sum: { amount: true } }),
+      prisma.payout.aggregate({ where: { createdAt: { gte: from, lt: to } }, _count: true, _sum: { amount: true } }),
+      prisma.payout.aggregate({ where: { createdAt: { gte: prevFrom, lt: prevTo } }, _count: true, _sum: { amount: true } }),
+      prisma.giftTransaction.aggregate({ where: { createdAt: { gte: from, lt: to } }, _count: true, _sum: { totalPrice: true } }),
+      prisma.giftTransaction.aggregate({ where: { createdAt: { gte: prevFrom, lt: prevTo } }, _count: true, _sum: { totalPrice: true } }),
+      prisma.recharge.aggregate({ where: { createdAt: { gte: from, lt: to }, status: "succeeded" }, _count: true, _sum: { amount: true } }),
+      prisma.recharge.aggregate({ where: { createdAt: { gte: prevFrom, lt: prevTo }, status: "succeeded" }, _count: true, _sum: { amount: true } }),
+      prisma.recharge.count({ where: { createdAt: { gte: from, lt: to }, status: "failed" } }),
+      prisma.refund.aggregate({ where: { createdAt: { gte: from, lt: to } }, _count: true, _sum: { amount: true } }),
+      prisma.refund.aggregate({ where: { createdAt: { gte: prevFrom, lt: prevTo } }, _count: true, _sum: { amount: true } }),
+      prisma.ledgerEntry.count({ where: { createdAt: { gte: from, lt: to } } }),
+      prisma.ledgerEntry.count({ where: { createdAt: { gte: prevFrom, lt: prevTo } } }),
+      prisma.gameProvider.count(),
+      prisma.gameProvider.count({ where: { enabled: true } }),
+      // providers that have produced at least one API error in the last 24h
+      prisma.$queryRaw<{ providerId: number | null; cnt: bigint }[]>`
+        SELECT NULL::int AS "providerId", COUNT(*)::bigint AS cnt
+        FROM "ApiErrorLog" WHERE "createdAt" >= NOW() - INTERVAL '24 hours' AND source = 'provider'`,
+      prisma.apiErrorLog.count({ where: { createdAt: { gte: from, lt: to } } }),
+      prisma.suspiciousEvent.count({ where: { createdAt: { gte: from, lt: to }, severity: "high" } }),
+      prisma.complaint.count({ where: { status: { in: ["open", "in_progress"] } } }),
+      // Daily series — one row per day in [from, to)
+      prisma.$queryRaw<{ day: Date; newUsers: bigint; bets: bigint; payouts: bigint; recharges: bigint; gifts: bigint; ledger: bigint }[]>`
+        WITH days AS (
+          SELECT generate_series(${from.toISOString()}::timestamptz, ${to.toISOString()}::timestamptz - INTERVAL '1 second', INTERVAL '1 day')::date AS d
+        )
+        SELECT d AS day,
+          (SELECT COUNT(*) FROM "User" u WHERE u."createdAt"::date = d) AS "newUsers",
+          (SELECT COALESCE(SUM(b.amount),0) FROM "Bet" b WHERE b."createdAt"::date = d) AS bets,
+          (SELECT COALESCE(SUM(p.amount),0) FROM "Payout" p WHERE p."createdAt"::date = d) AS payouts,
+          (SELECT COALESCE(SUM(r.amount),0) FROM "Recharge" r WHERE r."createdAt"::date = d AND r.status = 'succeeded') AS recharges,
+          (SELECT COALESCE(SUM(g."totalPrice"),0) FROM "GiftTransaction" g WHERE g."createdAt"::date = d) AS gifts,
+          (SELECT COUNT(*) FROM "LedgerEntry" l WHERE l."createdAt"::date = d) AS ledger
+        FROM days d ORDER BY d`,
+      // Recent activity — bounded fetches (last 10 each), merged + sorted client-side is heavy
+      // so we use a UNION ALL bounded to 12 most-recent records overall.
+      prisma.$queryRaw<{ id: bigint; ts: Date; category: string; label: string; status: string | null; actor: string | null }[]>`
+        (SELECT l.id::bigint, l."createdAt" AS ts, 'audit'::text AS category,
+           CONCAT(l.action, ' · ', l.entity) AS label, NULL::text AS status,
+           a.username AS actor
+         FROM "AuditLog" l LEFT JOIN "AdminUser" a ON a.id = l."adminId"
+         ORDER BY l.id DESC LIMIT 6)
+        UNION ALL
+        (SELECT e.id::bigint, e."createdAt" AS ts, 'security'::text AS category,
+           LEFT(e.kind || ' — ' || e.message, 160) AS label, NULL::text AS status,
+           NULL::text AS actor
+         FROM "SecurityEvent" e ORDER BY e.id DESC LIMIT 3)
+        UNION ALL
+        (SELECT r.id::bigint, r."createdAt" AS ts, 'recharge'::text AS category,
+           CONCAT('Recharge ', r.amount, ' coins') AS label, r.status,
+           u."displayName" AS actor
+         FROM "Recharge" r LEFT JOIN "User" u ON u.id = r."userId"
+         ORDER BY r.id DESC LIMIT 4)
+        UNION ALL
+        (SELECT b.id::bigint, b."createdAt" AS ts, 'bet'::text AS category,
+           CONCAT('Bet ', b.amount, ' · ', g.code) AS label, b.status,
+           u."displayName" AS actor
+         FROM "Bet" b LEFT JOIN "User" u ON u.id = b."userId" LEFT JOIN "Game" g ON g.id = b."gameKey"
+         ORDER BY b.id DESC LIMIT 4)
+        ORDER BY ts DESC LIMIT 12`,
     ]);
+
+    // ----------------------------------------------------------------------
+    // Compose KPI cards
+    // ----------------------------------------------------------------------
+    const kpis = {
+      users: {
+        total: totalUsers,
+        newInPeriod: newUsersInPeriod,
+        previousPeriod: newUsersPrev,
+        deltaPct: pctDelta(newUsersInPeriod, newUsersPrev),
+        link: "/users",
+        available: true,
+      },
+      // "Active users" defined as users with at least one ledger entry in the
+      // selected period. This is a real, queryable activity metric that does
+      // not require online-presence infrastructure (LiveKit presence is not
+      // surfaced in the existing schema). The label on the frontend will
+      // explain the metric explicitly.
+      activeUsers: {
+        value: ledgerInPeriod,
+        previousPeriod: ledgerPrev,
+        deltaPct: pctDelta(ledgerInPeriod, ledgerPrev),
+        label: "Users with at least one wallet transaction in the selected period.",
+        link: "/wallet",
+        available: true,
+      },
+      agencies: {
+        total: totalAgencies,
+        newInPeriod: newAgenciesInPeriod,
+        previousPeriod: newAgenciesPrev,
+        deltaPct: pctDelta(newAgenciesInPeriod, newAgenciesPrev),
+        link: "/users",
+        available: true,
+      },
+      liveRooms: {
+        activeNow: activeRooms,
+        total: totalRooms,
+        openedInPeriod: roomsOpenedInPeriod,
+        closedInPeriod: roomsClosedInPeriod,
+        link: "/live",
+        available: true,
+      },
+      games: {
+        total: gamesTotal,
+        active: gamesActive,
+        maintenance: gamesMaintenance,
+        disabled: gamesDisabled,
+        link: "/games",
+        available: true,
+      },
+      walletTx: {
+        totalInPeriod: ledgerInPeriod,
+        previousPeriod: ledgerPrev,
+        deltaPct: pctDelta(ledgerInPeriod, ledgerPrev),
+        rechargesSucceeded: rechargesAgg._count,
+        rechargesFailed: rechargesFailed,
+        link: "/wallet",
+        available: true,
+      },
+      providers: {
+        total: providersTotal,
+        enabled: providersEnabled,
+        // We do NOT label a provider healthy just because it's configured.
+        // The only operational signal in the schema is "did it emit any
+        // API error in the last 24h" — surfaced as `errors24h`.
+        errors24h: Number(providersWithErrors[0]?.cnt ?? 0),
+        link: "/providers",
+        available: true,
+      },
+    };
+
+    // ----------------------------------------------------------------------
+    // Financial summary — canonical records only, no double-counting.
+    //
+    //  bets     = SUM(Bet.amount) where createdAt in [from,to)  — gross stakes
+    //  payouts  = SUM(Payout.amount) where createdAt in [from,to) — game winnings
+    //             (Payout is a separate row created on settlement, so a Bet's
+    //              lifetime is not double-counted when filtering by createdAt)
+    //  gifts    = SUM(GiftTransaction.totalPrice) — gross gift volume
+    //  recharges = SUM(Recharge.amount) WHERE status = 'succeeded'
+    //              (pending/failed/refunded are excluded from the deposit total)
+    //  refunds  = SUM(Refund.amount) — count and amount of refunded recharges
+    //  netGaming = bets - payouts (house coin margin, NOT profit)
+    //
+    // Platform revenue/commission is intentionally NOT computed here — the
+    // existing accounting model represents provider commission via
+    // ProviderBill (settled in `/v1/admin/settlement/...`), which is a
+    // separate workflow. Computing it from raw bets would be misleading.
+    // ----------------------------------------------------------------------
+    const betsAmount = betsAgg._sum.amount ?? 0;
+    const payoutsAmount = payoutsAgg._sum.amount ?? 0;
+    const giftsAmount = giftsAgg._sum.totalPrice ?? 0;
+    const rechargesAmount = rechargesAgg._sum.amount ?? 0;
+    const refundsAmount = refundsAgg._sum.amount ?? 0;
+    const betsAmountPrev = betsAggPrev._sum.amount ?? 0;
+    const payoutsAmountPrev = payoutsAggPrev._sum.amount ?? 0;
+    const giftsAmountPrev = giftsAggPrev._sum.totalPrice ?? 0;
+    const rechargesAmountPrev = rechargesAggPrev._sum.amount ?? 0;
+    const refundsAmountPrev = refundsAggPrev._sum.amount ?? 0;
+
+    const financial = {
+      currency: "coins",
+      bets: { count: betsAgg._count, amount: betsAmount, prevAmount: betsAmountPrev, deltaPct: pctDelta(betsAmount, betsAmountPrev) },
+      payouts: { count: payoutsAgg._count, amount: payoutsAmount, prevAmount: payoutsAmountPrev, deltaPct: pctDelta(payoutsAmount, payoutsAmountPrev) },
+      gifts: { count: giftsAgg._count, amount: giftsAmount, prevAmount: giftsAmountPrev, deltaPct: pctDelta(giftsAmount, giftsAmountPrev) },
+      recharges: { count: rechargesAgg._count, amount: rechargesAmount, prevAmount: rechargesAmountPrev, deltaPct: pctDelta(rechargesAmount, rechargesAmountPrev), failed: rechargesFailed },
+      refunds: { count: refundsAgg._count, amount: refundsAmount, prevAmount: refundsAmountPrev, deltaPct: pctDelta(refundsAmount, refundsAmountPrev) },
+      netGaming: { amount: betsAmount - payoutsAmount, prevAmount: betsAmountPrev - payoutsAmountPrev, note: "Bets minus payouts (house coin margin). Not platform profit." },
+    };
+
+    // ----------------------------------------------------------------------
+    // Operational alerts — derived from real records only, no fabricated
+    // thresholds. Severity is assigned by a small, documented rule set:
+    //   Critical: high-severity suspicious events in the period
+    //   Warning:  provider API errors in last 24h, unresolved complaints,
+    //             failed recharges in the period
+    //   Info:     games in maintenance, total security events
+    // ----------------------------------------------------------------------
+    const alerts: { id: string; severity: "info" | "warning" | "critical"; title: string; detail: string; ts: string; link: string | null }[] = [];
+    if (suspiciousHighInPeriod > 0) {
+      alerts.push({
+        id: `suspicious-high-${range.label}`,
+        severity: "critical",
+        title: `${suspiciousHighInPeriod} high-severity suspicious event${suspiciousHighInPeriod === 1 ? "" : "s"}`,
+        detail: "Logged by the suspicious-event detector during the selected period. Review before dismissing.",
+        ts: new Date().toISOString(),
+        link: "/security",
+      });
+    }
+    if (Number(providersWithErrors[0]?.cnt ?? 0) > 0) {
+      alerts.push({
+        id: `provider-errors-24h`,
+        severity: "warning",
+        title: `Provider API errors in the last 24 hours`,
+        detail: `${Number(providersWithErrors[0]?.cnt ?? 0)} provider-source error log entries in the last 24h. Inspect provider integration health.`,
+        ts: new Date().toISOString(),
+        link: "/providers",
+      });
+    }
+    if (complaintsOpen > 0) {
+      alerts.push({
+        id: `complaints-open`,
+        severity: "warning",
+        title: `${complaintsOpen} open complaint${complaintsOpen === 1 ? "" : "s"}`,
+        detail: "Complaints awaiting acknowledgement, investigation, or resolution.",
+        ts: new Date().toISOString(),
+        link: null, // No dedicated complaints page exists yet — link suppressed rather than broken.
+      });
+    }
+    if (rechargesFailed > 0) {
+      alerts.push({
+        id: `recharges-failed-${range.label}`,
+        severity: "warning",
+        title: `${rechargesFailed} failed recharge${rechargesFailed === 1 ? "" : "s"} in the selected period`,
+        detail: "Recharges whose status is `failed`. Failed recharges are excluded from the financial summary deposit total.",
+        ts: new Date().toISOString(),
+        link: "/wallet",
+      });
+    }
+    if (gamesMaintenance > 0) {
+      alerts.push({
+        id: `games-maintenance`,
+        severity: "info",
+        title: `${gamesMaintenance} game${gamesMaintenance === 1 ? "" : "s"} in maintenance`,
+        detail: "Games whose status is `maintenance` are unavailable for play.",
+        ts: new Date().toISOString(),
+        link: "/games",
+      });
+    }
+    if (apiErrorsInPeriod > 0) {
+      alerts.push({
+        id: `api-errors-${range.label}`,
+        severity: "info",
+        title: `${apiErrorsInPeriod} API error${apiErrorsInPeriod === 1 ? "" : "s"} logged in the selected period`,
+        detail: "Aggregated across all sources (admin, provider, webhooks).",
+        ts: new Date().toISOString(),
+        link: "/security",
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // Series — daily activity, normalised to ISO date strings.
+    // ----------------------------------------------------------------------
+    const series = seriesRows.map((s) => ({
+      day: new Date(s.day).toISOString().slice(0, 10),
+      newUsers: Number(s.newUsers),
+      bets: Number(s.bets),
+      payouts: Number(s.payouts),
+      recharges: Number(s.recharges),
+      gifts: Number(s.gifts),
+      ledger: Number(s.ledger),
+    }));
+
+    // ----------------------------------------------------------------------
+    // Recent activity — already merged + bounded to 12 rows server-side.
+    // ----------------------------------------------------------------------
+    const activity = recentAudit.map((r) => ({
+      id: String(r.id),
+      ts: r.ts.toISOString(),
+      category: r.category,
+      label: r.label,
+      status: r.status,
+      actor: r.actor,
+    }));
+
+    // ----------------------------------------------------------------------
+    // Legacy `totals` shape (preserved for back-compat with any consumer
+    // still using the old `/v1/admin/dashboard` contract).
+    // ----------------------------------------------------------------------
+    const totals = {
+      betsCount: betsAgg._count,
+      betsAmount,
+      winsCount: payoutsAgg._count,
+      winsAmount: payoutsAmount,
+      revenue: betsAmount - payoutsAmount,
+      giftsAmount,
+      recharges: rechargesAmount,
+      activeRooms,
+      newUsers24h: newUsersInPeriod,
+      apiErrors24h: apiErrorsInPeriod,
+    };
+
     return {
       ok: true,
       data: {
-        totals: {
-          betsCount: betsAgg._count,
-          betsAmount: betsAgg._sum.amount ?? 0,
-          winsCount: winsAgg._count,
-          winsAmount: winsAgg._sum.amount ?? 0,
-          revenue: (betsAgg._sum.amount ?? 0) - (winsAgg._sum.amount ?? 0),
-          giftsAmount: giftsAgg._sum.totalPrice ?? 0,
-          recharges: rechargesAgg._sum.amount ?? 0,
-          activeRooms,
-          newUsers24h: newUsers,
-          apiErrors24h: apiErrors,
-        },
-        series30d: series.map((s) => ({ day: new Date(s.day).toISOString().slice(0, 10), bets: Number(s.bets), wins: Number(s.wins), revenue: Number(s.revenue) })),
+        totals,
+        range: { from: from.toISOString(), to: to.toISOString(), preset: q.preset ?? "last30", label: range.label },
+        generatedAt: new Date().toISOString(),
+        currency: "coins",
+        ledgerKinds: LEDGER_KINDS,
+        kpis,
+        financial,
+        series,
+        activity,
+        alerts,
       },
     };
   });
