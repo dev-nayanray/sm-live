@@ -1,0 +1,92 @@
+name: sm-live
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sm_live
+      POSTGRES_PASSWORD: sm_live
+      POSTGRES_DB: sm_live
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sm_live -d sm_live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --dev --bind 0.0.0.0
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+      - "50000-50100:50000-50100/udp"
+    environment:
+      LIVEKIT_KEYS: "devkey: devsecret_that_is_at_least_16_chars"
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://sm_live:sm_live@postgres:5432/sm_live?schema=public
+      REDIS_URL: redis://redis:6379
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: devsecret_that_is_at_least_16_chars
+      JWT_SECRET: change-me-in-production-min-32-chars!!
+      ADMIN_JWT_SECRET: change-me-also-in-production-min-32c
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8081,http://localhost:4100
+      PUBLIC_API_BASE: http://api:4000
+    ports:
+      - "4001:4000"
+
+  provider-mock:
+    build:
+      context: ..
+      dockerfile: apps/provider-mock/Dockerfile
+    depends_on:
+      - api
+    environment:
+      PORT: 4100
+      API_BASE: http://api:4000
+      MOCK_API_KEY: mockcorp-key-1
+      MOCK_API_SECRET: mockcorp-secret-please-rotate
+      DEFAULT_RTP: "0.97"
+    ports:
+      - "4100:4100"
+
+  admin:
+    build:
+      context: ..
+      dockerfile: apps/admin/Dockerfile
+    depends_on:
+      - api
+    environment:
+      VITE_API_BASE: http://localhost:4001
+    ports:
+      - "8081:80"
+
+volumes:
+  pgdata:

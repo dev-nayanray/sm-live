@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+*.log
+coverage/
+.vite/
+.turbo/
+apps/api/prisma/dev.db
+apps/mobile/.expo/
+apps/mobile/ios/
+apps/mobile/android/
+.DS_Store
+pdf_extract.txt

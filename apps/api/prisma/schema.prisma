@@ -1,0 +1,699 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===========================================================================
+// Identity
+// ===========================================================================
+
+model User {
+  id           Int      @id @default(autoincrement())
+  phone        String?  @unique
+  email        String?  @unique
+  passwordHash String
+  displayName  String
+  avatarUrl    String   @default("")
+  marketCode   String   @default("default")
+  country      String   @default("XX")
+  vipLevel     Int      @default(0)
+  nobleLevel   Int      @default(0)
+  isBot        Boolean  @default(false)
+  referrerCode String?
+  agencyId     Int?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  agency         Agency?             @relation(fields: [agencyId], references: [id])
+  wallet         Wallet?
+  bets           Bet[]
+  sessions       GameSession[]
+  giftsSent      GiftTransaction[]   @relation("GiftSender")
+  giftsReceived  GiftTransaction[]   @relation("GiftRecipient")
+  restrictions   PlayerRestriction[]
+  recharges      Recharge[]
+  otps           OtpCode[]
+  rankings       Ranking[]
+  roomsCreated   Room[]              @relation("RoomHost")
+  participations RoomParticipant[]
+  complaints     Complaint[]
+  refreshTokens  Session[]
+  agencyMembers  AgencyMember[]
+
+  @@index([agencyId])
+  @@index([marketCode])
+  @@index([createdAt])
+}
+
+model OtpCode {
+  id         Int      @id @default(autoincrement())
+  identifier String
+  code       String
+  expiresAt  DateTime
+  consumed   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  user       User?    @relation(fields: [userId], references: [id])
+  userId     Int?
+
+  @@index([identifier])
+}
+
+model Session {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  tokenHash String    @unique
+  userAgent String    @default("")
+  ip        String    @default("")
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model AdminUser {
+  id           Int       @id @default(autoincrement())
+  username     String    @unique
+  email        String    @unique
+  passwordHash String
+  displayName  String
+  roleId       Int
+  agencyId     Int?
+  active       Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  role      Role       @relation(fields: [roleId], references: [id])
+  agency    Agency?    @relation(fields: [agencyId], references: [id])
+  auditLogs AuditLog[]
+  refunds   Refund[]
+
+  @@index([roleId])
+}
+
+model Role {
+  id          Int              @id @default(autoincrement())
+  key         String           @unique
+  name        String
+  description String           @default("")
+  isSystem    Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+  permissions RolePermission[]
+  adminUsers  AdminUser[]
+
+  @@index([key])
+}
+
+model Permission {
+  id              Int              @id @default(autoincrement())
+  key             String           @unique
+  description     String           @default("")
+  rolePermissions RolePermission[]
+}
+
+model RolePermission {
+  roleId       Int
+  permissionId Int
+  role         Role       @relation(fields: [roleId], references: [id])
+  permission   Permission @relation(fields: [permissionId], references: [id])
+
+  @@id([roleId, permissionId])
+}
+
+model Agency {
+  id             Int      @id @default(autoincrement())
+  name           String
+  code           String   @unique
+  commissionRate Float    @default(0.1)
+  parentId       Int?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  parent      Agency?            @relation("AgencyTree", fields: [parentId], references: [id])
+  children    Agency[]           @relation("AgencyTree")
+  members     AgencyMember[]
+  users       User[]
+  admins      AdminUser[]
+  withdrawals AgencyWithdrawal[]
+
+  @@index([parentId])
+}
+
+model AgencyMember {
+  id       Int      @id @default(autoincrement())
+  agencyId Int
+  userId   Int
+  joinedAt DateTime @default(now())
+  agency   Agency   @relation(fields: [agencyId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+
+  @@unique([agencyId, userId])
+}
+
+model AgencyWithdrawal {
+  id        Int      @id @default(autoincrement())
+  agencyId  Int
+  amount    Int
+  status    String   @default("pending") // pending | approved | rejected
+  note      String   @default("")
+  createdAt DateTime @default(now())
+  agency    Agency   @relation(fields: [agencyId], references: [id])
+
+  @@index([agencyId])
+}
+
+// ===========================================================================
+// Content
+// ===========================================================================
+
+model Room {
+  id           Int               @id @default(autoincrement())
+  title        String
+  type         String // live | voice | party
+  slots        Int               @default(5)
+  country      String            @default("XX")
+  hostId       Int
+  isLocked     Boolean           @default(false)
+  livekitRoom  String            @default("")
+  createdAt    DateTime          @default(now())
+  closedAt     DateTime?
+  host         User              @relation("RoomHost", fields: [hostId], references: [id])
+  participants RoomParticipant[]
+
+  @@index([type])
+  @@index([country])
+  @@index([hostId])
+}
+
+model RoomParticipant {
+  id        Int       @id @default(autoincrement())
+  roomId    Int
+  userId    Int
+  slotIndex Int?
+  role      String    @default("audience") // host | cohost | audience
+  muted     Boolean   @default(false)
+  joinedAt  DateTime  @default(now())
+  leftAt    DateTime?
+  kickedAt  DateTime?
+  room      Room      @relation(fields: [roomId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@unique([roomId, userId])
+  @@index([userId])
+}
+
+model Gift {
+  id           Int               @id @default(autoincrement())
+  name         String
+  iconUrl      String            @default("")
+  price        Int
+  category     String            @default("basic")
+  animation    String            @default("small") // none | small | full
+  enabled      Boolean           @default(true)
+  sortOrder    Int               @default(0)
+  transactions GiftTransaction[]
+
+  @@index([category])
+}
+
+model GiftTransaction {
+  id               Int      @id @default(autoincrement())
+  senderId         Int
+  recipientId      Int
+  giftId           Int
+  roomId           Int?
+  quantity         Int      @default(1)
+  totalPrice       Int
+  agencyCommission Int      @default(0)
+  createdAt        DateTime @default(now())
+  gift             Gift     @relation(fields: [giftId], references: [id])
+  sender           User     @relation("GiftSender", fields: [senderId], references: [id])
+  recipient        User     @relation("GiftRecipient", fields: [recipientId], references: [id])
+
+  @@index([senderId])
+  @@index([recipientId])
+  @@index([createdAt])
+}
+
+model Ranking {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  period    String // daily | weekly | monthly
+  scope     String   @default("global")
+  points    Int      @default(0)
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@unique([userId, period, scope])
+  @@index([period, points])
+}
+
+model ShortVideo {
+  id        Int      @id @default(autoincrement())
+  authorId  Int
+  title     String   @default("")
+  videoUrl  String
+  coverUrl  String   @default("")
+  likes     Int      @default(0)
+  country   String   @default("XX")
+  status    String   @default("published") // published | hidden
+  createdAt DateTime @default(now())
+
+  @@index([status, createdAt])
+}
+
+model Moment {
+  id        Int      @id @default(autoincrement())
+  authorId  Int
+  text      String   @default("")
+  imageUrl  String   @default("")
+  likes     Int      @default(0)
+  country   String   @default("XX")
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// ===========================================================================
+// Wallet
+// ===========================================================================
+
+model Wallet {
+  id        Int           @id @default(autoincrement())
+  userId    Int           @unique
+  balance   Int           @default(0)
+  frozen    Boolean       @default(false)
+  updatedAt DateTime      @updatedAt
+  user      User          @relation(fields: [userId], references: [id])
+  entries   LedgerEntry[]
+}
+
+model LedgerEntry {
+  id           BigInt   @id @default(autoincrement())
+  userId       Int
+  walletId     Int
+  kind         String
+  amount       Int // signed: positive credit, negative debit
+  balanceAfter Int
+  txKey        String   @unique
+  refType      String?
+  refId        Int?
+  meta         Json?
+  createdAt    DateTime @default(now())
+  wallet       Wallet   @relation(fields: [walletId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([kind])
+  @@index([refType, refId])
+}
+
+model Recharge {
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  amount      Int
+  provider    String   @default("fake")
+  externalId  String   @unique
+  status      String   @default("succeeded") // pending | succeeded | failed
+  meta        Json?
+  createdById Int? // null = self, else AdminUser
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id])
+  refunds     Refund[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Refund {
+  id         Int       @id @default(autoincrement())
+  rechargeId Int       @unique
+  amount     Int
+  reason     String    @default("")
+  adminId    Int
+  createdAt  DateTime  @default(now())
+  recharge   Recharge  @relation(fields: [rechargeId], references: [id])
+  admin      AdminUser @relation(fields: [adminId], references: [id])
+}
+
+// ===========================================================================
+// Games
+// ===========================================================================
+
+model GameProvider {
+  id                Int                 @id @default(autoincrement())
+  name              String
+  code              String              @unique
+  apiBase           String
+  apiKey            String
+  apiSecret         String
+  commissionPct     Float               @default(0)
+  enabled           Boolean             @default(true)
+  games             Game[]
+  bills             ProviderBill[]
+  apiKeys           ApiAccessKey[]
+  settlementRecords SettlementRecord[]
+  monthlyFees       MonthlyServiceFee[]
+  integrationFees   IntegrationFee[]
+}
+
+model Game {
+  id           Int           @id @default(autoincrement())
+  code         String        @unique
+  name         String
+  version      String        @default("1.0.0")
+  status       String        @default("active") // active | maintenance | disabled
+  isPro        Boolean       @default(false)
+  providerId   Int?
+  thumbnailUrl String        @default("")
+  sortOrder    Int           @default(0)
+  provider     GameProvider? @relation(fields: [providerId], references: [id])
+  configs      GameConfig[]
+  rounds       GameRound[]
+  sessions     GameSession[]
+  rtpSnapshots RtpSnapshot[]
+  bets         Bet[]
+}
+
+model GameConfig {
+  id             Int    @id @default(autoincrement())
+  gameId         Int
+  marketId       Int
+  minBet         Int    @default(1)
+  maxBet         Int    @default(10000)
+  bettingSeconds Int    @default(30)
+  timeoutSeconds Int    @default(120)
+  stuckPolicy    String @default("refund") // refund | settle
+  game           Game   @relation(fields: [gameId], references: [id])
+  market         Market @relation(fields: [marketId], references: [id])
+
+  @@unique([gameId, marketId])
+}
+
+model GameRound {
+  id           Int       @id @default(autoincrement())
+  roundId      String    @unique // provider's round identifier
+  gameId       Int
+  sessionInfo  Json?
+  status       String    @default("open") // open | settled | cancelled
+  startedAt    DateTime  @default(now())
+  endedAt      DateTime?
+  resultJson   Json?
+  settleSource String    @default("webhook") // webhook | recovery | admin
+  game         Game      @relation(fields: [gameId], references: [id])
+  bets         Bet[]
+
+  @@index([gameId, startedAt])
+  @@index([status])
+}
+
+model GameSession {
+  id         Int       @id @default(autoincrement())
+  sessionKey String    @unique
+  userId     Int
+  gameId     Int
+  marketCode String    @default("default")
+  openedAt   DateTime  @default(now())
+  closedAt   DateTime?
+  user       User      @relation(fields: [userId], references: [id])
+  game       Game      @relation(fields: [gameId], references: [id])
+  bets       Bet[]
+
+  @@index([userId])
+  @@index([gameId])
+}
+
+model Bet {
+  id           Int         @id @default(autoincrement())
+  roundId      Int
+  sessionId    Int
+  userId       Int
+  gameKey      Int
+  amount       Int
+  status       String      @default("placed") // placed | won | lost | cancelled | refunded
+  payout       Int         @default(0)
+  providerTxId String      @unique
+  createdAt    DateTime    @default(now())
+  settledAt    DateTime?
+  round        GameRound   @relation(fields: [roundId], references: [id])
+  session      GameSession @relation(fields: [sessionId], references: [id])
+  user         User        @relation(fields: [userId], references: [id])
+  game         Game        @relation(fields: [gameKey], references: [id])
+  payouts      Payout[]
+
+  @@unique([roundId, providerTxId])
+  @@index([userId, createdAt])
+  @@index([roundId])
+  @@index([status])
+}
+
+model Payout {
+  id         Int      @id @default(autoincrement())
+  betId      Int
+  amount     Int
+  multiplier Float    @default(1)
+  createdAt  DateTime @default(now())
+  bet        Bet      @relation(fields: [betId], references: [id])
+}
+
+model RtpSnapshot {
+  id          Int      @id @default(autoincrement())
+  gameId      Int
+  windowStart DateTime
+  windowEnd   DateTime
+  totalBet    Int      @default(0)
+  totalPayout Int      @default(0)
+  rtp         Float    @default(0)
+  game        Game     @relation(fields: [gameId], references: [id])
+
+  @@index([gameId, windowStart])
+}
+
+// ===========================================================================
+// Control
+// ===========================================================================
+
+model PlayerRestriction {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  type      String // ban | mute | freeze_wallet | kick
+  reason    String    @default("")
+  createdBy Int
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([type, expiresAt])
+}
+
+model SuspiciousEvent {
+  id        Int      @id @default(autoincrement())
+  userId    Int?
+  kind      String
+  severity  String   @default("low") // low | medium | high
+  details   Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([severity])
+}
+
+model Complaint {
+  id           Int      @id @default(autoincrement())
+  userId       Int
+  subject      String
+  body         String
+  status       String   @default("open") // open | in_progress | resolved | rejected
+  assigneeNote String   @default("")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id])
+
+  @@index([status])
+}
+
+model ApiAccessKey {
+  id          Int          @id @default(autoincrement())
+  label       String
+  providerId  Int
+  key         String       @unique
+  ipAllowList String       @default("127.0.0.1,::1")
+  enabled     Boolean      @default(true)
+  provider    GameProvider @relation(fields: [providerId], references: [id])
+}
+
+model ApiErrorLog {
+  id        Int      @id @default(autoincrement())
+  source    String   @default("provider")
+  route     String
+  message   String
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([source])
+}
+
+model AuditLog {
+  id        Int        @id @default(autoincrement())
+  adminId   Int?
+  action    String
+  entity    String
+  entityId  String?
+  before    Json?
+  after     Json?
+  ip        String     @default("")
+  createdAt DateTime   @default(now())
+  admin     AdminUser? @relation(fields: [adminId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([adminId])
+  @@index([createdAt])
+}
+
+model SecurityEvent {
+  id        Int      @id @default(autoincrement())
+  kind      String
+  message   String
+  ip        String   @default("")
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// ===========================================================================
+// Settlement
+// ===========================================================================
+
+model ProviderBill {
+  id               Int          @id @default(autoincrement())
+  providerId       Int
+  periodStart      DateTime
+  periodEnd        DateTime
+  grossBets        Int          @default(0)
+  grossPayout      Int          @default(0)
+  commissionPct    Float        @default(0)
+  commissionAmount Int          @default(0)
+  serviceFee       Int          @default(0)
+  netPayable       Int          @default(0)
+  status           String       @default("draft") // draft | confirmed | paid
+  createdAt        DateTime     @default(now())
+  provider         GameProvider @relation(fields: [providerId], references: [id])
+
+  @@index([providerId, periodStart])
+}
+
+model SettlementRecord {
+  id         Int          @id @default(autoincrement())
+  providerId Int
+  billId     Int?
+  amount     Int
+  direction  String       @default("payable") // payable | receivable
+  method     String       @default("bank")
+  note       String       @default("")
+  createdAt  DateTime     @default(now())
+  provider   GameProvider @relation(fields: [providerId], references: [id])
+
+  @@index([providerId])
+}
+
+model MonthlyServiceFee {
+  id             Int           @id @default(autoincrement())
+  providerId     Int
+  month          DateTime
+  amount         Int
+  note           String        @default("")
+  createdAt      DateTime      @default(now())
+  gameProvider   GameProvider? @relation(fields: [gameProviderId], references: [id])
+  gameProviderId Int?
+
+  @@unique([providerId, month])
+}
+
+model IntegrationFee {
+  id             Int           @id @default(autoincrement())
+  providerId     Int
+  gameCode       String
+  amount         Int
+  paid           Boolean       @default(false)
+  note           String        @default("")
+  createdAt      DateTime      @default(now())
+  gameProvider   GameProvider? @relation(fields: [gameProviderId], references: [id])
+  gameProviderId Int?
+
+  @@index([providerId])
+}
+
+// ===========================================================================
+// Config
+// ===========================================================================
+
+model Setting {
+  key         String   @id
+  value       String
+  description String   @default("")
+  updatedAt   DateTime @updatedAt
+}
+
+model FeatureFlag {
+  id          Int     @id @default(autoincrement())
+  key         String  @unique
+  description String  @default("")
+  enabled     Boolean @default(false)
+  rolloutPct  Int     @default(100)
+}
+
+model Market {
+  id               Int             @id @default(autoincrement())
+  code             String          @unique
+  name             String
+  realMoneyEnabled Boolean         @default(false)
+  enabled          Boolean         @default(true)
+  configs          GameConfig[]
+  brandConfigs     BrandConfig[]
+  countryFilters   CountryFilter[]
+}
+
+model BrandConfig {
+  id           Int    @id @default(autoincrement())
+  marketId     Int    @unique
+  appName      String
+  logoUrl      String @default("")
+  primaryColor String @default("#7c3aed")
+  accentColor  String @default("#f43f5e")
+  bottomTabs   Json   @default("[]")
+  market       Market @relation(fields: [marketId], references: [id])
+}
+
+model CountryFilter {
+  id       Int     @id @default(autoincrement())
+  marketId Int
+  country  String
+  blocked  Boolean @default(false)
+  market   Market  @relation(fields: [marketId], references: [id])
+
+  @@unique([marketId, country])
+}
+
+// ===========================================================================
+// Reporting rollups
+// ===========================================================================
+
+model DailyRevenue {
+  day         DateTime @id
+  betsCount   Int      @default(0)
+  betsAmount  Int      @default(0)
+  winsCount   Int      @default(0)
+  winsAmount  Int      @default(0)
+  giftsAmount Int      @default(0)
+  recharges   Int      @default(0)
+  revenue     Int      @default(0) // bets - wins (house coin margin)
+}

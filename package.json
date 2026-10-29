@@ -1,0 +1,35 @@
+{
+  "name": "sm-live",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SM Live — live streaming + voice chat + games platform boilerplate (virtual coins, mock provider)",
+  "scripts": {
+    "build:shared": "pnpm -F @sm-live/shared build",
+    "dev": "pnpm dev:api",
+    "dev:api": "pnpm -F @sm-live/api dev",
+    "dev:admin": "pnpm -F @sm-live/admin dev",
+    "dev:provider-mock": "pnpm -F @sm-live/provider-mock dev",
+    "dev:mobile": "pnpm -F @sm-live/mobile start",
+    "dev:all": "node scripts/dev-all.mjs",
+    "db:migrate": "pnpm -F @sm-live/api prisma:migrate",
+    "db:seed": "pnpm -F @sm-live/api prisma:seed",
+    "db:studio": "pnpm -F @sm-live/api prisma:studio",
+    "build": "pnpm build:shared && pnpm -F @sm-live/api build && pnpm -F @sm-live/provider-mock build && pnpm -F @sm-live/admin build",
+    "lint": "eslint .",
+    "typecheck": "tsc -p apps/api --noEmit && tsc -p apps/admin --noEmit && tsc -p apps/provider-mock --noEmit && tsc -p packages/shared --noEmit",
+    "test": "pnpm -F @sm-live/api test",
+    "test:flow": "pnpm -F @sm-live/api test:flow",
+    "loadtest": "pnpm -F @sm-live/api test:load",
+    "compose:up": "docker compose -f infra/docker-compose.yml up -d",
+    "compose:down": "docker compose -f infra/docker-compose.yml down"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.14.0",
+    "eslint": "^9.14.0",
+    "typescript-eslint": "^8.15.0",
+    "concurrently": "^9.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
