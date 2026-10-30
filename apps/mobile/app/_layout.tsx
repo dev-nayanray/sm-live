@@ -57,6 +57,7 @@ function ThemedStack() {
         <Stack.Screen name="privacy" options={{ title: "Privacy policy" }} />
         <Stack.Screen name="chat/lobby" options={{ title: "Lobby" }} />
         <Stack.Screen name="search" options={{ title: "Search" }} />
+        <Stack.Screen name="live/start" options={{ title: "Start Live", headerShown: false }} />
       </Stack>
     </>
   );

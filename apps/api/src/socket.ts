@@ -7,6 +7,14 @@ import { logger } from "./lib/logger.js";
 
 let io: IOServer | null = null;
 
+/** Broadcast the current viewer count for a room to all its subscribers. */
+async function broadcastViewerCount(roomId: number) {
+  const count = await prisma.roomParticipant.count({
+    where: { roomId, leftAt: null, kickedAt: null },
+  });
+  io?.to(`room:${roomId}`).emit("room:viewer_count", { roomId, count });
+}
+
 export function initSocket(httpServer: HttpServer) {
   io = new IOServer(httpServer, { cors: { origin: env.CORS_ORIGINS.split(","), credentials: true } });
 
@@ -30,10 +38,15 @@ export function initSocket(httpServer: HttpServer) {
       const room = await prisma.room.findUnique({ where: { id: Number(roomId) } });
       if (!room || room.closedAt) return ack?.({ ok: false, error: "room not found" });
       await socket.join(`room:${roomId}`);
+      // Broadcast updated viewer count to everyone in the room.
+      void broadcastViewerCount(Number(roomId));
       ack?.({ ok: true });
     });
 
-    socket.on("room:leave", (roomId: number) => void socket.leave(`room:${roomId}`));
+    socket.on("room:leave", (roomId: number) => {
+      void socket.leave(`room:${roomId}`);
+      void broadcastViewerCount(Number(roomId));
+    });
 
     socket.on("chat:send", async (msg: { roomId: number; text: string }, ack?: (r: unknown) => void) => {
       const text = String(msg?.text ?? "").trim().slice(0, 300);
@@ -56,6 +69,7 @@ export function initSocket(httpServer: HttpServer) {
         data: { kickedAt: new Date(), slotIndex: null },
       });
       io?.to(`room:${p.roomId}`).emit("room:kicked", { roomId: p.roomId, userId: p.targetUserId });
+      void broadcastViewerCount(p.roomId);
       ack?.({ ok: true });
     });
 
@@ -84,7 +98,13 @@ export function initSocket(httpServer: HttpServer) {
       ack?.({ ok: true });
     });
 
-    socket.on("disconnect", () => { /* presence handled via RoomParticipant */ });
+    socket.on("disconnect", () => {
+      // Presence is handled via RoomParticipant.leftAt which is set by the
+      // /v1/rooms/:id/leave API. We don't auto-mark participants as left
+      // on socket disconnect because a brief network blip shouldn't drop
+      // a viewer from the audience list — they'll rejoin on reconnect.
+      // The host's /end endpoint is the authoritative "room closed" signal.
+    });
   });
 
   logger.info("socket.io initialised");

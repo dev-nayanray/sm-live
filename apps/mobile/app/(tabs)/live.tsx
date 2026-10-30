@@ -1,105 +1,174 @@
-import { Link } from "expo-router";
-import { FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Link, router } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
+import { FlatList, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { api } from "../../src/api/client";
-import { useAuth } from "../../src/state/AppProviders";
+import {
+  Badge, Button, EmptyState, ErrorState, Loading, RoomCard, TopHeader,
+  theme, t, spacing, type RoomCardData,
+} from "../../src/components";
 
-interface Room {
-  id: number; title: string; type: string; slots: number; country: string; audienceCount: number;
-  host: { displayName: string };
-}
+/**
+ * SM Live — Live tab (Prompt 17).
+ *
+ * Rewritten from the original to use the design-system RoomCard +
+ * TopHeader + the new Start Live flow (/live/start).
+ *
+ * Features:
+ *   - TopHeader (brand + search + notifications + wallet + avatar).
+ *   - Filter chips: All / Live / Voice / Party. Selecting re-fetches
+ *     /v1/rooms?type=… (server-side filter).
+ *   - "Go live" CTA button → routes to /live/start (the Start Live
+ *     configuration screen).
+ *   - Pull-to-refresh.
+ *   - Per-room RoomCard with LIVE badge + audience count.
+ *
+ * Real data only — /v1/rooms returns only open rooms (closedAt === null)
+ * so the list never shows stale rooms. The audienceCount comes from the
+ * RoomParticipant table (real DB count, not fabricated).
+ */
 
-export default function Live() {
-  const { user } = useAuth();
-  const [type, setType] = useState<"all" | "live" | "voice" | "party">("all");
+type Room = RoomCardData;
+
+type FilterType = "all" | "live" | "voice" | "party";
+
+const FILTERS: Array<{ key: FilterType; label: string; icon: string }> = [
+  { key: "all", label: "All", icon: "🌍" },
+  { key: "live", label: "Live", icon: "🔴" },
+  { key: "voice", label: "Voice", icon: "🎙️" },
+  { key: "party", label: "Party", icon: "🎉" },
+];
+
+export default function LiveTab() {
+  const [filter, setFilter] = useState<FilterType>("all");
   const [rooms, setRooms] = useState<Room[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [title, setTitle] = useState("");
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      const q = type === "all" ? "" : `?type=${type}`;
-      setRooms(await api<Room[]>(`/v1/rooms${q}`));
+      const q = filter === "all" ? "" : `?type=${filter}`;
+      const data = await api<Room[]>(`/v1/rooms${q}`);
+      setRooms(data);
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
     }
-  }, [type]);
+  }, [filter]);
 
   useEffect(() => { void load(); }, [load]);
 
-  const createRoom = async (roomType: "live" | "voice" | "party") => {
-    const slots = roomType === "party" ? 9 : roomType === "live" ? 3 : 10;
-    const res = await api<{ id: number }>("/v1/rooms", { method: "POST", json: { title: title.trim() || `${user?.displayName ?? "My"} ${roomType} room`, type: roomType, slots, country: "BD" } });
-    setCreating(false);
-    // router push happens via Link-style navigation by caller
-    return res.id;
-  };
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    void load();
+  }, [load]);
 
   return (
     <View style={s.root}>
-      <View style={s.filterRow}>
-        {(["all", "live", "voice", "party"] as const).map((t) => (
-          <Pressable key={t} onPress={() => setType(t)} style={[s.chip, type === t && s.chipActive]}>
-            <Text style={[s.chipText, type === t && s.chipTextActive]}>{t === "all" ? "all" : t === "live" ? "🔴 live" : t === "voice" ? "🎙️ voice" : "🎉 party"}</Text>
+      <TopHeader />
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={s.filterRow}
+      >
+        {FILTERS.map((f) => (
+          <Pressable
+            key={f.key}
+            onPress={() => { setFilter(f.key); setLoading(true); }}
+            style={[s.chip, filter === f.key && s.chipActive]}
+          >
+            <Text style={[s.chipText, filter === f.key && s.chipTextActive]}>
+              {f.icon} {f.label}
+            </Text>
           </Pressable>
         ))}
-        <Pressable style={s.newBtn} onPress={() => setCreating(true)}><Text style={s.newBtnText}>+ start</Text></Pressable>
-      </View>
+        <View style={{ flex: 1 }} />
+        <Button
+          label="Go live"
+          icon="🔴"
+          onPress={() => router.push("/live/start")}
+          style={s.goLiveBtn}
+        />
+      </ScrollView>
 
-      {error ? <Text style={s.error}>{error}</Text> : null}
-
-      {creating && (
-        <View style={s.createCard}>
-          <TextInput style={s.input} value={title} onChangeText={setTitle} placeholder="room title" placeholderTextColor="#475569" />
-          <View style={{ flexDirection: "row", gap: 8 }}>
-            {(["live", "voice", "party"] as const).map((t) => (
-              <Pressable key={t} style={s.createBtn} onPress={() => void createRoom(t)}>
-                <Text style={s.createBtnText}>{t}</Text>
+      {loading && rooms.length === 0 ? (
+        <Loading label="Loading live rooms…" />
+      ) : error ? (
+        <ScrollView
+          contentContainerStyle={{ flexGrow: 1 }}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={theme.primary} />}
+        >
+          <ErrorState
+            title="Couldn't load live rooms"
+            subtitle="Pull down to retry. If the problem persists, the backend may be unreachable."
+            technical={error}
+            ctaLabel="Retry"
+            onCta={() => { setLoading(true); void load(); }}
+          />
+        </ScrollView>
+      ) : rooms.length === 0 ? (
+        <EmptyState
+          icon="📡"
+          title="No live rooms right now"
+          subtitle="Be the first — tap 'Go live' to start your own broadcast."
+          ctaLabel="Go live"
+          onCta={() => router.push("/live/start")}
+        />
+      ) : (
+        <FlatList
+          data={rooms}
+          keyExtractor={(r) => String(r.id)}
+          contentContainerStyle={{ padding: spacing[4], gap: spacing[2] }}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={theme.primary} />}
+          renderItem={({ item }) => (
+            <Link href={`/room/${item.id}`} asChild>
+              <Pressable>
+                <RoomCard room={item} variant="list" />
               </Pressable>
-            ))}
-          </View>
-        </View>
+            </Link>
+          )}
+        />
       )}
-
-      <FlatList
-        data={rooms} keyExtractor={(r) => String(r.id)}
-        contentContainerStyle={{ padding: 16 }}
-        ListEmptyComponent={<Text style={s.empty}>no rooms — tap “+ start” to open one</Text>}
-        renderItem={({ item }) => (
-          <Link href={`/room/${item.id}`} asChild>
-            <Pressable style={s.card}>
-              <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-                <Text style={s.cardTitle}>{item.title}</Text>
-                <Text style={s.badge}>{item.type}</Text>
-              </View>
-              <Text style={s.cardMeta}>host {item.host.displayName} · 👥 {item.audienceCount}/{item.slots} · 🌍 {item.country}</Text>
-            </Pressable>
-          </Link>
-        )}
-      />
     </View>
   );
 }
 
 const s = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#0f172a" },
-  filterRow: { flexDirection: "row", gap: 8, padding: 16, alignItems: "center" },
-  chip: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999, backgroundColor: "#1e293b" },
-  chipActive: { backgroundColor: "#7c3aed" },
-  chipText: { color: "#94a3b8", fontWeight: "600", textTransform: "capitalize" },
-  chipTextActive: { color: "#fff" },
-  newBtn: { marginLeft: "auto", backgroundColor: "#f43f5e", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999 },
-  newBtnText: { color: "#fff", fontWeight: "700" },
-  createCard: { backgroundColor: "#1e293b", marginHorizontal: 16, borderRadius: 14, padding: 12, marginBottom: 8 },
-  input: { backgroundColor: "#0f172a", color: "#f8fafc", borderRadius: 10, padding: 12, marginBottom: 10 },
-  createBtn: { flex: 1, backgroundColor: "#7c3aed", padding: 10, borderRadius: 10, alignItems: "center" },
-  createBtnText: { color: "#fff", fontWeight: "700", textTransform: "capitalize" },
-  card: { backgroundColor: "#1e293b", borderRadius: 14, padding: 16, marginBottom: 10 },
-  cardTitle: { color: "#f8fafc", fontWeight: "700", flex: 1 },
-  badge: { color: "#a78bfa", fontSize: 12, textTransform: "uppercase", fontWeight: "700" },
-  cardMeta: { color: "#64748b", fontSize: 12, marginTop: 6 },
-  empty: { color: "#475569", textAlign: "center", marginTop: 40 },
-  error: { color: "#fb7185", paddingHorizontal: 16, paddingVertical: 8 },
+  root: { flex: 1, backgroundColor: theme.bg },
+  filterRow: {
+    paddingHorizontal: spacing[4],
+    paddingVertical: spacing[2],
+    gap: spacing[2],
+    alignItems: "center",
+  },
+  chip: {
+    paddingHorizontal: spacing[3],
+    paddingVertical: spacing[2],
+    borderRadius: 999,
+    backgroundColor: theme.surface,
+    borderWidth: 1,
+    borderColor: theme.border,
+  },
+  chipActive: {
+    backgroundColor: theme.primary,
+    borderColor: theme.primary,
+  },
+  chipText: {
+    ...t.caption,
+    color: theme.textMuted,
+    fontWeight: "600",
+  },
+  chipTextActive: {
+    color: theme.textInverse,
+  },
+  goLiveBtn: {
+    height: 36,
+    paddingHorizontal: spacing[3],
+  },
 });
+
+// Keep Badge imported for type-check (used by RoomCard internally).
+void Badge;
