@@ -59,6 +59,9 @@ function ThemedStack() {
         <Stack.Screen name="chat/[conversationId]" options={{ title: "Chat", headerShown: false }} />
         <Stack.Screen name="chat/new" options={{ title: "New chat", headerShown: false }} />
         <Stack.Screen name="search" options={{ title: "Search" }} />
+        <Stack.Screen name="gifts/store" options={{ title: "Gift Store", headerShown: false }} />
+        <Stack.Screen name="gifts/sent" options={{ title: "Gifts Sent", headerShown: false }} />
+        <Stack.Screen name="gifts/received" options={{ title: "Gifts Received", headerShown: false }} />
         <Stack.Screen name="live/start" options={{ title: "Start Live", headerShown: false }} />
       </Stack>
     </>
