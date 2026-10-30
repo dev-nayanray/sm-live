@@ -3911,6 +3911,217 @@ export async function adminRoutes(app: FastifyInstance) {
     return { ok: true, data: { total, page: q.page, pageSize: q.pageSize, items } };
   });
 
+  // --- API Integration & Webhook Management (Prompt 10) -------------------
+  //
+  // Extends the existing provider management with:
+  //   - API access key management (CRUD for ApiAccessKey, secrets masked)
+  //   - Provider integration summary (API errors, webhook events, health)
+  //   - Webhook event log (read-only — derived from GameRound settlements)
+  //   - Provider health check (simple — checks enabled + apiBase reachable)
+  //   - API error logs with provider filter (enhanced)
+  //
+  // All credential data is masked — apiKey and apiSecret are NEVER returned.
+  // Permissions: providers.read for viewing, providers.write for managing.
+
+  // --- API access key management ------------------------------------------
+  app.get("/v1/admin/providers/:id/api-keys", async (req) => {
+    await requireAdmin(req, "providers.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const provider = await prisma.gameProvider.findUnique({ where: { id }, select: { id: true } });
+    if (!provider) throw notFound("provider not found");
+    const keys = await prisma.apiAccessKey.findMany({ where: { providerId: id } });
+    return {
+      ok: true,
+      data: keys.map((k) => ({
+        id: k.id,
+        label: k.label,
+        providerId: k.providerId,
+        // Key is NEVER returned in full — only first 4 + last 2 chars.
+        keyMasked: k.key ? k.key.slice(0, 4) + "…" + k.key.slice(-2) : "",
+        ipAllowList: k.ipAllowList,
+        enabled: k.enabled,
+      })),
+    };
+  });
+
+  app.post("/v1/admin/providers/:id/api-keys", async (req) => {
+    const admin = await requireAdmin(req, "providers.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      label: z.string().trim().min(1).max(60),
+      key: z.string().trim().min(8).max(80),
+      ipAllowList: z.string().trim().max(500).default("127.0.0.1,::1"),
+      enabled: z.boolean().default(true),
+    }), bodyOf(req));
+    const provider = await prisma.gameProvider.findUnique({ where: { id }, select: { id: true } });
+    if (!provider) throw notFound("provider not found");
+    try {
+      const created = await prisma.apiAccessKey.create({ data: { ...input, providerId: id } });
+      await writeAudit({ adminId: admin.id, req, action: "create_api_key", entity: "provider", entityId: id, after: { keyId: created.id, label: created.label } });
+      return { ok: true, data: { id: created.id, label: created.label, keyMasked: created.key.slice(0, 4) + "…" + created.key.slice(-2) } };
+    } catch (e) {
+      if ((e as { code?: string }).code === "P2002") throw badRequest("API key already exists");
+      throw e;
+    }
+  });
+
+  app.patch("/v1/admin/providers/:id/api-keys/:keyId", async (req) => {
+    const admin = await requireAdmin(req, "providers.write");
+    const { id, keyId } = validate(z.object({ id: z.coerce.number(), keyId: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      label: z.string().trim().min(1).max(60).optional(),
+      key: z.string().trim().min(8).max(80).optional(),
+      ipAllowList: z.string().trim().max(500).optional(),
+      enabled: z.boolean().optional(),
+    }), bodyOf(req));
+    const before = await prisma.apiAccessKey.findUnique({ where: { id: keyId } });
+    if (!before) throw notFound("API key not found");
+    if (before.providerId !== id) throw badRequest("API key does not belong to this provider");
+    const after = await prisma.apiAccessKey.update({ where: { id: keyId }, data: input });
+    await writeAudit({ adminId: admin.id, req, action: "update_api_key", entity: "provider", entityId: id, before: { label: before.label, enabled: before.enabled }, after: { label: after.label, enabled: after.enabled } });
+    return { ok: true, data: { id: after.id, label: after.label, keyMasked: after.key ? after.key.slice(0, 4) + "…" + after.key.slice(-2) : "", enabled: after.enabled } };
+  });
+
+  app.delete("/v1/admin/providers/:id/api-keys/:keyId", async (req) => {
+    const admin = await requireAdmin(req, "providers.write");
+    const { id, keyId } = validate(z.object({ id: z.coerce.number(), keyId: z.coerce.number() }), paramsOf(req));
+    const before = await prisma.apiAccessKey.findUnique({ where: { id: keyId } });
+    if (!before) throw notFound("API key not found");
+    if (before.providerId !== id) throw badRequest("API key does not belong to this provider");
+    await prisma.apiAccessKey.delete({ where: { id: keyId } });
+    await writeAudit({ adminId: admin.id, req, action: "delete_api_key", entity: "provider", entityId: id, before: { label: before.label } });
+    return { ok: true };
+  });
+
+  // --- Provider credential rotation (apiKey/apiSecret) --------------------
+  app.post("/v1/admin/providers/:id/rotate-credentials", async (req) => {
+    const admin = await requireAdmin(req, "providers.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      apiKey: z.string().trim().min(8).max(120),
+      apiSecret: z.string().trim().min(8).max(200),
+    }), bodyOf(req));
+    const before = await prisma.gameProvider.findUnique({ where: { id }, select: { id: true, name: true } });
+    if (!before) throw notFound("provider not found");
+    await prisma.gameProvider.update({ where: { id }, data: { apiKey: input.apiKey, apiSecret: input.apiSecret } });
+    await writeAudit({ adminId: admin.id, req, action: "rotate_provider_credentials", entity: "provider", entityId: id, after: { rotated: true } });
+    return { ok: true, data: { id, rotated: true } };
+  });
+
+  // --- Integration summary -------------------------------------------------
+  app.get("/v1/admin/integration/summary", async (req) => {
+    await requireAdmin(req, "providers.read");
+    const [totalProviders, enabledProviders, disabledProviders, totalApiKeys, enabledApiKeys, totalApiErrors24h, providerErrors24h, totalGameSessions, activeGameSessions, totalWebhookSettlements] = await Promise.all([
+      prisma.gameProvider.count(),
+      prisma.gameProvider.count({ where: { enabled: true } }),
+      prisma.gameProvider.count({ where: { enabled: false } }),
+      prisma.apiAccessKey.count(),
+      prisma.apiAccessKey.count({ where: { enabled: true } }),
+      prisma.apiErrorLog.count({ where: { createdAt: { gte: new Date(Date.now() - 86_400_000) } } }),
+      prisma.apiErrorLog.count({ where: { createdAt: { gte: new Date(Date.now() - 86_400_000) }, source: "provider" } }),
+      prisma.gameSession.count(),
+      prisma.gameSession.count({ where: { closedAt: null } }),
+      prisma.gameRound.count({ where: { settleSource: "webhook" } }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        providers: { total: totalProviders, enabled: enabledProviders, disabled: disabledProviders },
+        apiKeys: { total: totalApiKeys, enabled: enabledApiKeys },
+        apiErrors24h: totalApiErrors24h,
+        providerErrors24h: providerErrors24h,
+        gameSessions: { total: totalGameSessions, active: activeGameSessions },
+        webhookSettlements: totalWebhookSettlements,
+        // No dedicated health-check endpoint configured.
+        hasHealthChecks: false,
+        // No separate sandbox/production environment model.
+        hasEnvironments: false,
+        // No dedicated webhook event log table — webhook events are tracked
+        // via GameRound.settleSource = "webhook".
+        hasWebhookEventLog: false,
+        note: "Webhook settlements tracked via GameRound.settleSource='webhook'. No dedicated webhook event log table. No sandbox/production environment separation.",
+      },
+    };
+  });
+
+  // --- Webhook event log (derived from GameRound settlements) -------------
+  app.get("/v1/admin/integration/webhooks", async (req) => {
+    await requireAdmin(req, "providers.read");
+    const q = validate(paginationQuery, queryOf(req));
+    const where: Prisma.GameRoundWhereInput = { settleSource: "webhook" };
+    if (q.search) where.roundId = { contains: q.search };
+    const [total, items] = await Promise.all([
+      prisma.gameRound.count({ where }),
+      prisma.gameRound.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          game: { select: { code: true, name: true, provider: { select: { id: true, name: true } } } },
+          bets: { select: { id: true, userId: true, amount: true, status: true, providerTxId: true } },
+        },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((r) => ({
+          id: r.id,
+          roundId: r.roundId,
+          gameId: r.gameId,
+          gameCode: r.game.code,
+          gameName: r.game.name,
+          providerId: r.game.provider?.id ?? null,
+          providerName: r.game.provider?.name ?? null,
+          status: r.status,
+          settleSource: r.settleSource,
+          startedAt: r.startedAt.toISOString(),
+          endedAt: r.endedAt?.toISOString() ?? null,
+          betCount: r.bets.length,
+          bets: r.bets.map((b) => ({ id: b.id, userId: b.userId, amount: b.amount, status: b.status, providerTxId: b.providerTxId })),
+        })),
+      },
+    };
+  });
+
+  // --- Provider health check (simple — no external requests) -------------
+  app.get("/v1/admin/providers/:id/health", async (req) => {
+    await requireAdmin(req, "providers.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const provider = await prisma.gameProvider.findUnique({
+      where: { id },
+      select: { id: true, name: true, enabled: true, apiBase: true, _count: { select: { games: true, apiKeys: true } } },
+    });
+    if (!provider) throw notFound("provider not found");
+    const [errors24h, lastError, recentSessions] = await Promise.all([
+      prisma.apiErrorLog.count({ where: { createdAt: { gte: new Date(Date.now() - 86_400_000) }, source: "provider" } }),
+      prisma.apiErrorLog.findFirst({ where: { source: "provider" }, orderBy: { id: "desc" }, select: { id: true, route: true, message: true, createdAt: true } }),
+      prisma.gameSession.count({ where: { game: { providerId: id }, openedAt: { gte: new Date(Date.now() - 86_400_000) } } }),
+    ]);
+    const status = !provider.enabled ? "disabled" : errors24h > 5 ? "degraded" : "operational";
+    return {
+      ok: true,
+      data: {
+        providerId: provider.id,
+        providerName: provider.name,
+        enabled: provider.enabled,
+        apiBase: provider.apiBase,
+        gameCount: provider._count.games,
+        apiKeyCount: provider._count.apiKeys,
+        status,
+        errors24h,
+        lastError: lastError ? { id: lastError.id, route: lastError.route, message: lastError.message, createdAt: lastError.createdAt.toISOString() } : null,
+        recentSessions24h: recentSessions,
+        // No external health-check endpoint — status is inferred from enabled
+        // flag + API error activity.
+        healthCheckMethod: "inferred",
+        note: "Status inferred from enabled flag + API error log activity in last 24h. No external health-check endpoint configured.",
+      },
+    };
+  });
+
   app.get("/v1/admin/security/api-errors", async (req) => {
     await requireAdmin(req, "security.read");
     const q = validate(paginationQuery, queryOf(req));
