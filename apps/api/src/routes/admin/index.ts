@@ -3532,14 +3532,373 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // --- Security ---------------------------------------------------------------
-  app.get("/v1/admin/security/audit", async (req) => {
+  // --- System Settings, Security, Admin Roles & Audit Logs (Prompt 09) ------
+  //
+  // Extends existing security/settings routes with:
+  //   - Admin user list (filtered, paginated, with role + agency join)
+  //   - Admin user detail (with audit history + security events)
+  //   - Admin user activation/deactivation (with last-super-admin protection)
+  //   - Admin user role change (with super_admin protection)
+  //   - All permissions list (organized by module)
+  //   - Audit log with filters (admin, entity, action, date range)
+  //   - Security events with filters (kind, date range)
+  //   - System settings overview (all Setting + FeatureFlag records)
+  //   - System settings update (single key → value, audited)
+  //
+  // Permissions:
+  //   - security.read — view admin users, roles, permissions, audit, events
+  //   - security.write — manage admin users, roles, permissions
+  //   - settings.read — view system settings
+  //   - settings.write — modify system settings
+
+  // --- Admin user management ----------------------------------------------
+  app.get("/v1/admin/admin-users", async (req) => {
     await requireAdmin(req, "security.read");
     const q = validate(paginationQuery, queryOf(req));
+    const where: Prisma.AdminUserWhereInput = {};
+    if (q.search) {
+      where.OR = [
+        { username: { contains: q.search, mode: "insensitive" } },
+        { displayName: { contains: q.search, mode: "insensitive" } },
+        { email: { contains: q.search, mode: "insensitive" } },
+      ];
+    }
+    const roleKey = (req.query as { roleKey?: string }).roleKey;
+    if (roleKey) where.role = { key: roleKey };
     const [total, items] = await Promise.all([
-      prisma.auditLog.count(),
-      prisma.auditLog.findMany({ orderBy: { id: "desc" }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, include: { admin: { select: { username: true, displayName: true } } } }),
+      prisma.adminUser.count({ where }),
+      prisma.adminUser.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          role: { select: { id: true, key: true, name: true } },
+          agency: { select: { id: true, name: true, code: true } },
+        },
+      }),
     ]);
-    return { ok: true, data: { total, page: q.page, pageSize: q.pageSize, items } };
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((a) => ({
+          id: a.id,
+          username: a.username,
+          email: a.email,
+          displayName: a.displayName,
+          role: a.role,
+          agency: a.agency,
+          active: a.active,
+          lastLoginAt: a.lastLoginAt?.toISOString() ?? null,
+          createdAt: a.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/admin-users/:id", async (req) => {
+    await requireAdmin(req, "security.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const [admin, auditLogs, securityEvents] = await Promise.all([
+      prisma.adminUser.findUnique({
+        where: { id },
+        include: {
+          role: { include: { permissions: { include: { permission: true } } } },
+          agency: { select: { id: true, name: true, code: true } },
+        },
+      }),
+      prisma.auditLog.findMany({ where: { adminId: id }, orderBy: { id: "desc" }, take: 30 }),
+      prisma.securityEvent.findMany({ where: { meta: { path: ["adminId"], equals: id } }, orderBy: { id: "desc" }, take: 20 } as never),
+    ]);
+    if (!admin) throw notFound("admin user not found");
+    return {
+      ok: true,
+      data: {
+        profile: {
+          id: admin.id,
+          username: admin.username,
+          email: admin.email,
+          displayName: admin.displayName,
+          active: admin.active,
+          lastLoginAt: admin.lastLoginAt?.toISOString() ?? null,
+          createdAt: admin.createdAt.toISOString(),
+          updatedAt: admin.updatedAt.toISOString(),
+          role: admin.role ? {
+            id: admin.role.id, key: admin.role.key, name: admin.role.name,
+            permissions: admin.role.permissions.map((p) => p.permission.key),
+          } : null,
+          agency: admin.agency,
+        },
+        recentAudit: auditLogs.map((a) => ({
+          id: a.id, action: a.action, entity: a.entity, entityId: a.entityId,
+          ip: a.ip, createdAt: a.createdAt.toISOString(),
+        })),
+        // Security events may not have adminId in meta — this is best-effort.
+        recentSecurityEvents: securityEvents.map((e) => ({
+          id: e.id, kind: e.kind, message: e.message, ip: e.ip, createdAt: e.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  app.patch("/v1/admin/admin-users/:id", async (req) => {
+    const admin = await requireAdmin(req, "security.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      active: z.boolean().optional(),
+      roleKey: z.string().optional(),
+      displayName: z.string().min(2).max(60).optional(),
+    }), bodyOf(req));
+
+    const target = await prisma.adminUser.findUnique({ where: { id }, include: { role: true } });
+    if (!target) throw notFound("admin user not found");
+
+    // Last super_admin protection: if deactivating or changing role away from
+    // super_admin, verify at least one other active super_admin remains.
+    if (target.role.key === "super_admin") {
+      if (input.active === false || (input.roleKey && input.roleKey !== "super_admin")) {
+        const otherSuperAdmins = await prisma.adminUser.count({
+          where: {
+            active: true,
+            id: { not: id },
+            role: { key: "super_admin" },
+          },
+        });
+        if (otherSuperAdmins === 0) {
+          throw badRequest("Cannot deactivate or demote the last active super_admin");
+        }
+      }
+    }
+
+    const before: Record<string, unknown> = {
+      active: target.active,
+      displayName: target.displayName,
+      role: target.role.key,
+    };
+
+    const updateData: Record<string, unknown> = {};
+    if (input.active !== undefined) updateData.active = input.active;
+    if (input.displayName !== undefined) updateData.displayName = input.displayName;
+    if (input.roleKey) {
+      const role = await prisma.role.findUnique({ where: { key: input.roleKey } });
+      if (!role) throw badRequest("unknown role");
+      updateData.roleId = role.id;
+    }
+
+    const after = await prisma.adminUser.update({ where: { id }, data: updateData, include: { role: true } });
+    await writeAudit({
+      adminId: admin.id, req,
+      action: "update_admin_user",
+      entity: "admin_user", entityId: id,
+      before,
+      after: { active: after.active, displayName: after.displayName, role: after.role.key },
+    });
+    return { ok: true, data: { id: after.id, active: after.active, role: after.role.key } };
+  });
+
+  // --- All permissions list ------------------------------------------------
+  app.get("/v1/admin/permissions", async (req) => {
+    await requireAdmin(req, "security.read");
+    const perms = await prisma.permission.findMany({ orderBy: { key: "asc" } });
+    return { ok: true, data: perms.map((p) => ({ id: p.id, key: p.key, description: p.description })) };
+  });
+
+  // --- Enhanced audit log with filters -------------------------------------
+  app.get("/v1/admin/security/audit", async (req) => {
+    await requireAdmin(req, "security.read");
+    const q = validate(paginationQuery.extend({
+      adminId: z.coerce.number().int().positive().optional(),
+      entity: z.string().trim().max(60).optional(),
+      action: z.string().trim().max(60).optional(),
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    }), queryOf(req));
+    const where: Prisma.AuditLogWhereInput = {};
+    if (q.search) where.OR = [{ action: { contains: q.search } }, { entity: { contains: q.search } }];
+    if (q.adminId) where.adminId = q.adminId;
+    if (q.entity) where.entity = q.entity;
+    if (q.action) where.action = { contains: q.action };
+    if (q.from || q.to) {
+      const f: Prisma.DateTimeFilter = {};
+      if (q.from) f.gte = new Date(`${q.from}T00:00:00.000Z`);
+      if (q.to) {
+        const t = new Date(`${q.to}T00:00:00.000Z`);
+        t.setUTCDate(t.getUTCDate() + 1);
+        f.lt = t;
+      }
+      where.createdAt = f;
+    }
+    const [total, items] = await Promise.all([
+      prisma.auditLog.count({ where }),
+      prisma.auditLog.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: { admin: { select: { id: true, username: true, displayName: true } } },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        // Never expose before/after that might contain secrets — only safe fields.
+        items: items.map((a) => ({
+          id: a.id,
+          adminId: a.adminId,
+          admin: a.admin ? { id: a.admin.id, username: a.admin.username, displayName: a.admin.displayName } : null,
+          action: a.action,
+          entity: a.entity,
+          entityId: a.entityId,
+          ip: a.ip,
+          createdAt: a.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  // --- Audit log CSV export ------------------------------------------------
+  app.get("/v1/admin/security/audit/export", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req, reply) => {
+    await requireAdmin(req, "security.read");
+    const rows = await prisma.auditLog.findMany({
+      orderBy: { id: "desc" },
+      take: 5000,
+      include: { admin: { select: { username: true, displayName: true } } },
+    });
+    const headers = ["id", "adminId", "adminUsername", "action", "entity", "entityId", "ip", "createdAt"];
+    const escape = (v: unknown): string => {
+      let s = v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+      if (/[",\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const lines = [
+      headers.join(","),
+      ...rows.map((a) => headers.map((h) => {
+        switch (h) {
+          case "id": return escape(a.id);
+          case "adminId": return escape(a.adminId ?? "");
+          case "adminUsername": return escape(a.admin?.username ?? "");
+          case "action": return escape(a.action);
+          case "entity": return escape(a.entity);
+          case "entityId": return escape(a.entityId ?? "");
+          case "ip": return escape(a.ip);
+          case "createdAt": return escape(a.createdAt.toISOString());
+          default: return "";
+        }
+      }).join(",")),
+    ];
+    const csv = lines.join("\n");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    reply.header("content-type", "text/csv; charset=utf-8");
+    reply.header("content-disposition", `attachment; filename="audit-${stamp}.csv"`);
+    reply.header("x-export-row-count", String(rows.length));
+    return csv;
+  });
+
+  // --- System settings overview --------------------------------------------
+  app.get("/v1/admin/settings/overview", async (req) => {
+    await requireAdmin(req, "settings.read");
+    const [settings, featureFlags, adminCount, roleCount, permCount, recentAudit] = await Promise.all([
+      prisma.setting.findMany({ orderBy: { key: "asc" } }),
+      prisma.featureFlag.findMany({ orderBy: { key: "asc" } }),
+      prisma.adminUser.count(),
+      prisma.role.count(),
+      prisma.permission.count(),
+      prisma.auditLog.findMany({ orderBy: { id: "desc" }, take: 5, include: { admin: { select: { username: true, displayName: true } } } }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        platform: {
+          name: "SM Live",
+          version: "0.1.0",
+          environment: process.env.NODE_ENV ?? "development",
+          timezone: "UTC",
+          nodeVersion: process.version,
+          uptimeSeconds: Math.floor(process.uptime()),
+        },
+        settings: settings.map((s) => ({
+          key: s.key, value: s.value, description: s.description,
+          updatedAt: s.updatedAt.toISOString(),
+        })),
+        featureFlags: featureFlags.map((f) => ({
+          id: f.id, key: f.key, description: f.description,
+          enabled: f.enabled, rolloutPct: f.rolloutPct,
+        })),
+        counts: {
+          admins: adminCount,
+          roles: roleCount,
+          permissions: permCount,
+        },
+        recentAudit: recentAudit.map((a) => ({
+          id: a.id,
+          action: a.action,
+          entity: a.entity,
+          admin: a.admin?.displayName ?? "system",
+          createdAt: a.createdAt.toISOString(),
+        })),
+        // No maintenance-mode backend mechanism exists.
+        hasMaintenanceMode: false,
+        // No email/notification infrastructure.
+        hasNotificationService: false,
+        // No IP allow/block list beyond provider API keys.
+        hasIPRestrictions: false,
+        // No MFA infrastructure.
+        hasMFA: false,
+        // No session management table for admin sessions.
+        hasAdminSessionManagement: false,
+      },
+    };
+  });
+
+  // --- System setting update -----------------------------------------------
+  app.patch("/v1/admin/settings/:key", async (req) => {
+    const admin = await requireAdmin(req, "settings.write");
+    const { key } = validate(z.object({ key: z.string().min(1).max(80) }), paramsOf(req));
+    const input = validate(z.object({
+      value: z.string().trim().min(1).max(2000),
+      description: z.string().trim().max(200).optional(),
+    }), bodyOf(req));
+
+    const before = await prisma.setting.findUnique({ where: { key } });
+    // Setting might not exist yet — upsert.
+    const after = await prisma.setting.upsert({
+      where: { key },
+      update: { value: input.value, ...(input.description ? { description: input.description } : {}) },
+      create: { key, value: input.value, description: input.description ?? "" },
+    });
+    await writeAudit({
+      adminId: admin.id, req,
+      action: "update_setting",
+      entity: "setting", entityId: key,
+      before: before ? { value: before.value } : null,
+      after: { value: after.value },
+    });
+    return { ok: true, data: { key: after.key, value: after.value } };
+  });
+
+  // --- Feature flag update -------------------------------------------------
+  app.patch("/v1/admin/feature-flags/:id", async (req) => {
+    const admin = await requireAdmin(req, "settings.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      enabled: z.boolean().optional(),
+      rolloutPct: z.coerce.number().int().min(0).max(100).optional(),
+      description: z.string().trim().max(200).optional(),
+    }), bodyOf(req));
+    const before = await prisma.featureFlag.findUnique({ where: { id } });
+    if (!before) throw notFound("feature flag not found");
+    const after = await prisma.featureFlag.update({ where: { id }, data: input });
+    await writeAudit({
+      adminId: admin.id, req,
+      action: "update_feature_flag",
+      entity: "feature_flag", entityId: String(id),
+      before: { enabled: before.enabled, rolloutPct: before.rolloutPct },
+      after: { enabled: after.enabled, rolloutPct: after.rolloutPct },
+    });
+    return { ok: true, data: { id: after.id, key: after.key, enabled: after.enabled, rolloutPct: after.rolloutPct } };
   });
 
   app.get("/v1/admin/security/events", async (req) => {
