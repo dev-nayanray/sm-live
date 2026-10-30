@@ -6,7 +6,7 @@ import { useAppConfig } from "../../src/state/AppProviders";
 /** Games list straight from GET /v1/config/app — no hard-coded entries. */
 export default function Games() {
   const { config, flag } = useAppConfig();
-  const [error, setError] = useState<string | null>(null);
+  const [error] = useState<string | null>(null);
 
   const enabled = flag("games.enabled");
   const games = config.games;
@@ -33,8 +33,6 @@ export default function Games() {
       </View>
     );
   }
-
-  void api; // health probe helper kept for pull-to-refresh wiring
 
   return (
     <FlatList

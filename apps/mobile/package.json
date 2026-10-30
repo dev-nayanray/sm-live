@@ -14,6 +14,7 @@
     "@config-plugins/react-native-webrtc": "^10.0.0",
     "@livekit/react-native": "^2.4.0",
     "@react-native-async-storage/async-storage": "1.23.1",
+    "@sm-live/shared": "workspace:*",
     "expo": "~52.0.20",
     "expo-application": "~6.0.1",
     "expo-constants": "~17.0.3",
@@ -31,18 +32,18 @@
     "react-native-svg": "15.8.0",
     "react-native-webrtc": "^124.0.5",
     "react-native-webview": "13.12.5",
-    "socket.io-client": "^4.8.1",
-    "@sm-live/shared": "workspace:*"
+    "socket.io-client": "^4.8.1"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
+    "@babel/preset-typescript": "^7.26.0",
+    "@types/jest": "^29.5.14",
+    "@types/node": "22",
     "@types/react": "~18.3.12",
+    "babel-jest": "^29.7.0",
     "jest": "^29.7.0",
     "jest-expo": "~52.0.2",
-    "typescript": "^5.7.2",
-    "@types/jest": "^29.5.14",
-    "babel-jest": "^29.7.0",
-    "@babel/preset-typescript": "^7.26.0"
+    "typescript": "^5.7.2"
   },
   "jest": {
     "testEnvironment": "node",

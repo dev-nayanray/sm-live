@@ -91,12 +91,16 @@ async function main() {
       logoUrl: "",
       primaryColor: "#7c3aed",
       accentColor: "#f43f5e",
+      // Prompt 13 default 5-tab navigation: Home, Discover, Live, Messages,
+      // Profile. Games is reachable from Home + Discover (not a primary
+      // tab). Admins can override via the BrandConfig editor without a
+      // release — the bottom-tabs array drives the mobile tab bar.
       bottomTabs: [
         { key: "home", label: "Home", icon: "home", visible: true },
-        { key: "games", label: "Games", icon: "grid", visible: true },
+        { key: "discover", label: "Discover", icon: "compass", visible: true },
         { key: "live", label: "Live", icon: "radio", visible: true },
-        { key: "chat", label: "Chat", icon: "message", visible: true },
-        { key: "me", label: "Me", icon: "user", visible: true },
+        { key: "messages", label: "Messages", icon: "message", visible: true },
+        { key: "me", label: "Profile", icon: "user", visible: true },
       ],
     },
     update: {},

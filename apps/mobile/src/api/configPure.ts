@@ -37,7 +37,16 @@ export const DEFAULT_CONFIG: AppConfigResponse = {
   flags: {},
   games: [],
   gifts: [],
-  bottomTabs: [],
+  // Prompt 13 default 5-tab nav — Home, Discover, Live, Messages, Profile.
+  // Served before the API responds (and as a fallback when the API sends
+  // an empty array). Server value is authoritative once it arrives.
+  bottomTabs: [
+    { key: "home", label: "Home", icon: "home", visible: true },
+    { key: "discover", label: "Discover", icon: "compass", visible: true },
+    { key: "live", label: "Live", icon: "radio", visible: true },
+    { key: "messages", label: "Messages", icon: "message", visible: true },
+    { key: "me", label: "Profile", icon: "user", visible: true },
+  ],
   market: "default",
   realMoneyEnabled: false,
   generatedAt: "",
