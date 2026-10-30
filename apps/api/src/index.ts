@@ -16,6 +16,7 @@ import { contentRoutes } from "./routes/v1/content.js";
 import { feedRoutes } from "./routes/v1/feed.js";
 import { messageRoutes } from "./routes/v1/messages.js";
 import { socialRoutes } from "./routes/v1/social.js";
+import { vipRoutes } from "./routes/v1/vip.js";
 import { adminRoutes } from "./routes/admin/index.js";
 import { adminResourceRoutes } from "./routes/admin/resources.js";
 import { providerRoutes } from "./routes/provider.js";
@@ -88,6 +89,7 @@ async function main() {
   await app.register(feedRoutes);
   await app.register(messageRoutes);
   await app.register(socialRoutes);
+  await app.register(vipRoutes);
   await app.register(adminRoutes);
   await app.register(adminResourceRoutes);
   await app.register(providerRoutes);

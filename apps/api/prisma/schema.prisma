@@ -54,6 +54,7 @@ model User {
   blockedBy      UserBlock[]      @relation("BlockBlocked")
   reportsMade    UserReport[]     @relation("ReportReporter")
   reportsAgainst UserReport[]     @relation("ReportReported")
+  vipMemberships VipMembership[]
 
   @@index([agencyId])
   @@index([marketCode])
@@ -1232,4 +1233,39 @@ model UserReport {
   @@index([reporterId])
   @@index([reportedId])
   @@index([status])
+}
+
+// ===========================================================================
+// VIP Membership (Prompt 21)
+// ===========================================================================
+
+/**
+ * VipMembership — a purchased VIP membership record. `level` is the VIP
+ * level (1-10), `planKey` identifies the plan (e.g. "vip1_30d"),
+ * `coinsPaid` is the amount deducted from the wallet, `status` is
+ * active | expired | cancelled, `expiresAt` is the authoritative
+ * expiration timestamp.
+ *
+ * VIP levels + plans are configured via the Setting table (key prefix
+ * "vip.plan.") so the admin can adjust prices/durations without a code
+ * change. The User.vipLevel field is the user's CURRENT effective level —
+ * updated by the purchase endpoint when a membership activates. When a
+ * membership expires, the user's vipLevel drops back to 0 (or to the
+ * highest still-active membership, if stacked).
+ */
+model VipMembership {
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  level       Int
+  planKey     String   @default("")
+  coinsPaid   Int      @default(0)
+  status      String   @default("active") // active | expired | cancelled
+  activatedAt DateTime @default(now())
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status, expiresAt])
 }
