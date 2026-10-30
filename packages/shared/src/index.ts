@@ -124,6 +124,35 @@ export function isPhoneLike(s: string): boolean {
   return /^\+?[0-9]{8,15}$/.test(s.trim());
 }
 
+/**
+ * Search query schema (Prompt 15).
+ *
+ * Used by /v1/users/search + /v1/rooms/search. The `q` field is trimmed
+ * server-side and clamped to a max length so a malicious client can't
+ * submit a 10KB query. Min length 2 prevents single-character queries
+ * that would surface too many rows.
+ */
+export const searchQuerySchema = paginationQuery.extend({
+  q: z.string().trim().min(2).max(120),
+  type: z.enum(["all", "live", "voice", "party"]).optional(),
+});
+export type SearchQuery = z.infer<typeof searchQuerySchema>;
+
+/**
+ * Home feed query (Prompt 15).
+ *
+ * Optional `category` filter selects one of the supported feed
+ * categories: for_you (default — surfaces a mix), live (open live rooms
+ * only), popular (rooms ranked by audience count), creators (top weekly
+ * gifters). The backend decides what each category returns; the client
+ * just passes the category key.
+ */
+export const homeFeedQuerySchema = z.object({
+  category: z.enum(["for_you", "live", "popular", "creators"]).default("for_you"),
+  country: z.string().trim().length(2).optional(),
+});
+export type HomeFeedQuery = z.infer<typeof homeFeedQuerySchema>;
+
 // --- Rooms ---
 export const createRoomSchema = z.object({
   title: z.string().trim().min(2).max(80),

@@ -19,7 +19,7 @@ import { radius } from "../theme/spacing";
 export interface AvatarProps {
   name?: string | null;
   imageUrl?: string | null;
-  size?: 32 | 40 | 48 | 56 | 72;
+  size?: 28 | 32 | 40 | 48 | 56 | 72;
   vipLevel?: number;
 }
 
