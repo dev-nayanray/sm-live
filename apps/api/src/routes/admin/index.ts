@@ -8,6 +8,7 @@ import {
   agencyCreateSchema, agencyUpdateSchema, agencyStatusChangeSchema, agencyListQuerySchema,
   roomReportCreateSchema, roomReportUpdateSchema, roomListQuerySchema,
   gameStatusChangeSchema, gameListQuerySchema, providerListQuerySchema, sessionListQuerySchema,
+  ledgerListQuerySchema, walletListQuerySchema,
 } from "@sm-live/shared";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
@@ -2146,6 +2147,425 @@ export async function adminRoutes(app: FastifyInstance) {
       include: { game: { select: { code: true, name: true } } },
     });
     return { ok: true, data: rows };
+  });
+
+  // --- Wallet management (Prompt 07) --------------------------------------
+  //
+  // Extends the existing wallet routes with:
+  //   - Wallet summary KPIs (total wallets, total balance, credits/debits,
+  //     recharges, refunds, pending/failed transactions)
+  //   - Filtered + paginated wallet list with frozen/balance filters
+  //   - Wallet detail with recent ledger entries + integrity check
+  //   - Filtered + paginated ledger (by kind, user, date, amount range)
+  //   - Recharges list (with status filter)
+  //   - Refunds list
+  //   - Agency withdrawals list
+  //   - Reconciliation (ledger integrity check + recharge/ledger mismatch)
+  //   - CSV export for ledger entries
+  //
+  // All financial data is READ-ONLY through these endpoints. Wallet
+  // mutations (recharge, adjust, refund) go through the existing dedicated
+  // endpoints that use the ledger service with idempotency + row locking.
+  app.get("/v1/admin/wallet/summary", async (req) => {
+    await requireAdmin(req, "wallet.read");
+    const q = validate(z.object({
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    }), queryOf(req));
+
+    // Build date filter for ledger queries.
+    const dateFilter: Prisma.LedgerEntryWhereInput = {};
+    if (q.from) dateFilter.createdAt = { gte: new Date(`${q.from}T00:00:00.000Z`) };
+    if (q.to) {
+      const t = new Date(`${q.to}T00:00:00.000Z`);
+      t.setUTCDate(t.getUTCDate() + 1);
+      const existing: Prisma.DateTimeFilter = dateFilter.createdAt as Prisma.DateTimeFilter ?? {};
+      dateFilter.createdAt = { ...existing, lt: t };
+    }
+
+    const [
+      totalWallets, totalBalance, frozenWallets,
+      totalCredits, totalDebits,
+      rechargeAmount, rechargeCount,
+      refundAmount, refundCount,
+      betDebitAmount, winCreditAmount,
+      giftDebitAmount, giftCreditAmount,
+      adminAdjustAmount,
+      pendingRecharges, failedRecharges,
+      pendingWithdrawals, approvedWithdrawals,
+    ] = await Promise.all([
+      prisma.wallet.count(),
+      prisma.wallet.aggregate({ _sum: { balance: true } }),
+      prisma.wallet.count({ where: { frozen: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, amount: { gt: 0 } }, _sum: { amount: true }, _count: true }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, amount: { lt: 0 } }, _sum: { amount: true }, _count: true }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, kind: "recharge" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.count({ where: { ...dateFilter, kind: "recharge" } }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, kind: "refund" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.count({ where: { ...dateFilter, kind: "refund" } }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, kind: "bet_debit" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, kind: "win_credit" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, kind: "gift_debit" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, kind: "gift_credit" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...dateFilter, kind: "admin_adjust" }, _sum: { amount: true } }),
+      prisma.recharge.count({ where: { status: "pending" } }),
+      prisma.recharge.count({ where: { status: "failed" } }),
+      prisma.agencyWithdrawal.count({ where: { status: "pending" } }),
+      prisma.agencyWithdrawal.count({ where: { status: "approved" } }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        currency: "coins",
+        totalWallets,
+        totalBalance: totalBalance._sum.balance ?? 0,
+        frozenWallets,
+        totalCredits: totalCredits._sum.amount ?? 0,
+        totalCreditCount: totalCredits._count,
+        totalDebits: Math.abs(totalDebits._sum.amount ?? 0),
+        totalDebitCount: totalDebits._count,
+        rechargeAmount: rechargeAmount._sum.amount ?? 0,
+        rechargeCount,
+        refundAmount: Math.abs(refundAmount._sum.amount ?? 0),
+        refundCount,
+        betDebitAmount: Math.abs(betDebitAmount._sum.amount ?? 0),
+        winCreditAmount: winCreditAmount._sum.amount ?? 0,
+        giftDebitAmount: Math.abs(giftDebitAmount._sum.amount ?? 0),
+        giftCreditAmount: giftCreditAmount._sum.amount ?? 0,
+        adminAdjustAmount: adminAdjustAmount._sum.amount ?? 0,
+        pendingRecharges,
+        failedRecharges,
+        pendingWithdrawals,
+        approvedWithdrawals,
+        // Net gaming margin = bets - wins (house coin margin, NOT profit)
+        netGamingMargin: Math.abs(betDebitAmount._sum.amount ?? 0) - (winCreditAmount._sum.amount ?? 0),
+        note: "Net gaming margin = bet debits - win credits. NOT platform profit — commission is settled separately via ProviderBill.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/wallet/wallets", async (req) => {
+    await requireAdmin(req, "wallet.read");
+    const q = validate(walletListQuerySchema, queryOf(req));
+    const where: Prisma.WalletWhereInput = {};
+    if (q.search) {
+      const n = Number(q.search);
+      if (!Number.isNaN(n) && Number.isInteger(n)) where.userId = n;
+    }
+    if (q.frozen === "true") where.frozen = true;
+    else if (q.frozen === "false") where.frozen = false;
+    if (q.minBalance != null || q.maxBalance != null) {
+      where.balance = {};
+      if (q.minBalance != null) where.balance.gte = q.minBalance;
+      if (q.maxBalance != null) where.balance.lte = q.maxBalance;
+    }
+    const [total, items] = await Promise.all([
+      prisma.wallet.count({ where }),
+      prisma.wallet.findMany({
+        where,
+        orderBy: { balance: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          user: { select: { id: true, displayName: true, phone: true, email: true, createdAt: true } },
+        },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((w) => ({
+          id: w.id,
+          userId: w.userId,
+          displayName: w.user?.displayName ?? "—",
+          phone: w.user?.phone ?? null,
+          email: w.user?.email ?? null,
+          balance: w.balance,
+          frozen: w.frozen,
+          status: w.frozen ? "frozen" : "active",
+          updatedAt: w.updatedAt.toISOString(),
+          userCreatedAt: w.user?.createdAt.toISOString() ?? null,
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/wallet/wallets/:userId", async (req) => {
+    await requireAdmin(req, "wallet.read");
+    const { userId } = validate(z.object({ userId: z.coerce.number() }), paramsOf(req));
+    const [wallet, recentEntries, rechargeCount, refundCount, betCount] = await Promise.all([
+      prisma.wallet.findUnique({
+        where: { userId },
+        include: { user: { select: { id: true, displayName: true, phone: true, email: true, createdAt: true } } },
+      }),
+      prisma.ledgerEntry.findMany({
+        where: { userId },
+        orderBy: { id: "desc" },
+        take: 20,
+      }),
+      prisma.ledgerEntry.count({ where: { userId, kind: "recharge" } }),
+      prisma.ledgerEntry.count({ where: { userId, kind: "refund" } }),
+      prisma.bet.count({ where: { userId } }),
+    ]);
+    if (!wallet) throw notFound("wallet not found");
+
+    // Run integrity check for this user.
+    const integrity = await ledgerIntegrityCheck([userId]);
+
+    return {
+      ok: true,
+      data: {
+        wallet: {
+          id: wallet.id,
+          userId: wallet.userId,
+          balance: wallet.balance,
+          frozen: wallet.frozen,
+          status: wallet.frozen ? "frozen" : "active",
+          updatedAt: wallet.updatedAt.toISOString(),
+          user: wallet.user ? {
+            id: wallet.user.id,
+            displayName: wallet.user.displayName,
+            createdAt: wallet.user.createdAt.toISOString(),
+          } : null,
+        },
+        recentEntries: recentEntries.map((e) => ({
+          id: e.id.toString(),
+          kind: e.kind,
+          amount: e.amount,
+          balanceAfter: e.balanceAfter,
+          txKey: e.txKey,
+          refType: e.refType,
+          refId: e.refId,
+          createdAt: e.createdAt.toISOString(),
+        })),
+        counts: {
+          recharges: rechargeCount,
+          refunds: refundCount,
+          bets: betCount,
+        },
+        integrity: integrity.mismatches.length === 0
+          ? { ok: true }
+          : { ok: false, mismatch: integrity.mismatches[0] },
+      },
+    };
+  });
+
+  app.get("/v1/admin/wallet/transactions", async (req) => {
+    await requireAdmin(req, "wallet.read");
+    const q = validate(ledgerListQuerySchema, queryOf(req));
+    const where: Prisma.LedgerEntryWhereInput = {};
+    if (q.search) {
+      const n = Number(q.search);
+      if (!Number.isNaN(n) && Number.isInteger(n)) where.userId = n;
+      else where.txKey = { contains: q.search };
+    }
+    if (q.kind) where.kind = q.kind;
+    if (q.userId) where.userId = q.userId;
+    if (q.from || q.to) {
+      const f: Prisma.DateTimeFilter = {};
+      if (q.from) f.gte = new Date(`${q.from}T00:00:00.000Z`);
+      if (q.to) {
+        const t = new Date(`${q.to}T00:00:00.000Z`);
+        t.setUTCDate(t.getUTCDate() + 1);
+        f.lt = t;
+      }
+      where.createdAt = f;
+    }
+    if (q.minAmount != null || q.maxAmount != null) {
+      where.amount = {};
+      if (q.minAmount != null) where.amount.gte = q.minAmount;
+      if (q.maxAmount != null) where.amount.lte = q.maxAmount;
+    }
+
+    const [total, items] = await Promise.all([
+      prisma.ledgerEntry.count({ where }),
+      prisma.ledgerEntry.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        // BigInt id → string; never return meta (may contain admin context).
+        items: items.map((e) => ({
+          id: e.id.toString(),
+          userId: e.userId,
+          kind: e.kind,
+          amount: e.amount,
+          balanceAfter: e.balanceAfter,
+          txKey: e.txKey,
+          refType: e.refType,
+          refId: e.refId,
+          createdAt: e.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/wallet/refunds", async (req) => {
+    await requireAdmin(req, "wallet.read");
+    const q = validate(paginationQuery, queryOf(req));
+    const [total, items] = await Promise.all([
+      prisma.refund.count(),
+      prisma.refund.findMany({
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          recharge: { select: { id: true, userId: true, amount: true, status: true, createdAt: true } },
+          admin: { select: { id: true, username: true, displayName: true } },
+        },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((r) => ({
+          id: r.id,
+          rechargeId: r.rechargeId,
+          amount: r.amount,
+          reason: r.reason,
+          adminId: r.adminId,
+          admin: r.admin ? { id: r.admin.id, username: r.admin.username, displayName: r.admin.displayName } : null,
+          recharge: r.recharge ? {
+            id: r.recharge.id,
+            userId: r.recharge.userId,
+            originalAmount: r.recharge.amount,
+            status: r.recharge.status,
+            createdAt: r.recharge.createdAt.toISOString(),
+          } : null,
+          createdAt: r.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/wallet/withdrawals", async (req) => {
+    await requireAdmin(req, "wallet.read");
+    const q = validate(paginationQuery.extend({
+      status: z.enum(["pending", "approved", "rejected"]).optional(),
+    }), queryOf(req));
+    const where: Prisma.AgencyWithdrawalWhereInput = {};
+    if (q.status) where.status = q.status;
+    const [total, items] = await Promise.all([
+      prisma.agencyWithdrawal.count({ where }),
+      prisma.agencyWithdrawal.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: { agency: { select: { id: true, name: true, code: true } } },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((w) => ({
+          id: w.id,
+          agencyId: w.agencyId,
+          agencyName: w.agency?.name ?? "—",
+          agencyCode: w.agency?.code ?? "—",
+          amount: w.amount,
+          status: w.status,
+          note: w.note,
+          createdAt: w.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/wallet/reconciliation", async (req) => {
+    await requireAdmin(req, "wallet.read");
+    // 1. Ledger integrity: SUM(ledgerEntry.amount) == wallet.balance for every user.
+    const integrity = await ledgerIntegrityCheck();
+    // 2. Pending recharges that should have a ledger entry but might not.
+    const pendingRecharges = await prisma.recharge.findMany({
+      where: { status: "succeeded" },
+      take: 100,
+      select: { id: true, userId: true, amount: true, createdAt: true },
+    });
+    // Check each succeeded recharge has a matching ledger entry.
+    const unmatchedRecharges: { rechargeId: number; userId: number; amount: number }[] = [];
+    for (const r of pendingRecharges.slice(0, 50)) {
+      const entry = await prisma.ledgerEntry.findUnique({ where: { txKey: `recharge:${r.id}` } });
+      if (!entry) unmatchedRecharges.push({ rechargeId: r.id, userId: r.userId, amount: r.amount });
+    }
+    // 3. Duplicate detection: check for duplicate txKeys (should be impossible due to unique constraint).
+    const duplicateTxKeys = await prisma.$queryRaw<{ txKey: string; cnt: bigint }[]>`
+      SELECT "txKey", COUNT(*) as cnt FROM "LedgerEntry" GROUP BY "txKey" HAVING COUNT(*) > 1 LIMIT 10`;
+    return {
+      ok: true,
+      data: {
+        integrity: {
+          ok: integrity.ok,
+          mismatchCount: integrity.mismatches.length,
+          mismatches: integrity.mismatches.slice(0, 20),
+        },
+        unmatchedRecharges,
+        unmatchedCount: unmatchedRecharges.length,
+        duplicateTxKeys: duplicateTxKeys.map((d) => ({ txKey: d.txKey, count: Number(d.cnt) })),
+        duplicateCount: duplicateTxKeys.length,
+        note: "Diagnostic only — no automatic corrections. Any discrepancy requires an authorized financial workflow to resolve.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/wallet/export", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req, reply) => {
+    await requireAdmin(req, "wallet.read");
+    const q = validate(ledgerListQuerySchema, queryOf(req));
+    const where: Prisma.LedgerEntryWhereInput = {};
+    if (q.kind) where.kind = q.kind;
+    if (q.userId) where.userId = q.userId;
+    if (q.from) where.createdAt = { gte: new Date(`${q.from}T00:00:00.000Z`) };
+    if (q.to) {
+      const t = new Date(`${q.to}T00:00:00.000Z`);
+      t.setUTCDate(t.getUTCDate() + 1);
+      const existing: Prisma.DateTimeFilter = where.createdAt as Prisma.DateTimeFilter ?? {};
+      where.createdAt = { ...existing, lt: t };
+    }
+    const rows = await prisma.ledgerEntry.findMany({
+      where,
+      orderBy: { id: "asc" },
+      take: 5000,
+    });
+    const headers = ["id", "userId", "kind", "amount", "balanceAfter", "txKey", "refType", "refId", "createdAt"];
+    const escape = (v: unknown): string => {
+      let s = v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+      if (/[",\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const lines = [
+      headers.join(","),
+      ...rows.map((e) => headers.map((h) => {
+        switch (h) {
+          case "id": return escape(e.id.toString());
+          case "userId": return escape(e.userId);
+          case "kind": return escape(e.kind);
+          case "amount": return escape(e.amount);
+          case "balanceAfter": return escape(e.balanceAfter);
+          case "txKey": return escape(e.txKey);
+          case "refType": return escape(e.refType ?? "");
+          case "refId": return escape(e.refId ?? "");
+          case "createdAt": return escape(e.createdAt.toISOString());
+          default: return "";
+        }
+      }).join(",")),
+    ];
+    const csv = lines.join("\n");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    reply.header("content-type", "text/csv; charset=utf-8");
+    reply.header("content-disposition", `attachment; filename="ledger-${stamp}.csv"`);
+    reply.header("x-export-row-count", String(rows.length));
+    return csv;
   });
 
   // --- Players -------------------------------------------------------------

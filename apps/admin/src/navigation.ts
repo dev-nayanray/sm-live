@@ -189,15 +189,14 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "Wallet Overview",
         perm: "wallet.read",
         icon: "wallet",
-        hint: "Ledger explorer, recharges, refunds, adjustments (existing page).",
+        hint: "Financial dashboard, wallets, transactions, recharges, refunds, reconciliation.",
       },
       {
-        to: null,
+        to: "/wallet",
         label: "Coin Transactions",
         perm: "wallet.read",
         icon: "coins",
-        planned: true,
-        hint: "Per-user coin movement explorer — planned for a later phase (today: Wallet → Ledger).",
+        hint: "Ledger explorer with kind/user/date/amount filters + CSV export.",
       },
       {
         to: null,

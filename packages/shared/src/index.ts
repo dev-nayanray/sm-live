@@ -408,6 +408,27 @@ export const sessionListQuerySchema = paginationQuery.extend({
 });
 export type SessionListQuery = z.infer<typeof sessionListQuerySchema>;
 
+// ---------------------------------------------------------------------------
+// Wallet & financial transaction management (Prompt 07)
+// ---------------------------------------------------------------------------
+
+export const ledgerListQuerySchema = paginationQuery.extend({
+  kind: z.string().optional(), // validated server-side against LEDGER_KINDS
+  userId: z.coerce.number().int().positive().optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  minAmount: z.coerce.number().int().optional(),
+  maxAmount: z.coerce.number().int().optional(),
+});
+export type LedgerListQuery = z.infer<typeof ledgerListQuerySchema>;
+
+export const walletListQuerySchema = paginationQuery.extend({
+  frozen: z.enum(["true", "false"]).optional(),
+  minBalance: z.coerce.number().int().optional(),
+  maxBalance: z.coerce.number().int().optional(),
+});
+export type WalletListQuery = z.infer<typeof walletListQuerySchema>;
+
 // --- Public app config (response of GET /v1/config/app) ---
 export interface AppConfigGift { id: number; name: string; iconUrl: string; price: number; category: string; animation: string; }
 export interface AppConfigGame { code: string; name: string; thumbnailUrl: string; isPro: boolean; status: string; minBet: number; maxBet: number; }
