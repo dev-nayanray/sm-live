@@ -9,16 +9,33 @@ import {
   roomReportCreateSchema, roomReportUpdateSchema, roomListQuerySchema,
   gameStatusChangeSchema, gameListQuerySchema, providerListQuerySchema, sessionListQuerySchema,
   ledgerListQuerySchema, walletListQuerySchema, analyticsQuerySchema,
+  // Platform Operations (Prompt 12) — type re-exports used by route handlers.
+  // The constant arrays (MAINTENANCE_SCOPES etc.) are referenced by the
+  // Zod schemas; we re-import them here only for the `typeof X[number]`
+  // expressions used as Prisma type parameters.
+  maintenanceCreateSchema, maintenanceUpdateSchema, maintenanceActionSchema, maintenanceListQuerySchema,
+  backupCreateSchema, backupDeleteSchema, backupVerifySchema, backupListQuerySchema,
+  recoveryCreateSchema,
+  incidentCreateSchema, incidentUpdateSchema, incidentListQuerySchema,
+  alertListQuerySchema, alertAckSchema, alertResolveSchema,
+  logListQuerySchema, jobListQuerySchema, jobRetrySchema,
+  MAINTENANCE_EVENT_TYPES,
 } from "@sm-live/shared";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
-import { unauthorized, notFound, badRequest, forbidden } from "../../lib/errors.js";
+import { unauthorized, notFound, badRequest, forbidden, notConfigured, conflict } from "../../lib/errors.js";
 import { validate, bodyOf, paramsOf, queryOf } from "../../lib/validate.js";
 import { requireAdmin, signAdminToken, verifyPassword, hashPassword } from "../../lib/auth.js";
 import { writeAudit, recordApiError } from "../../lib/audit.js";
 import { postLedgerEntries, ledgerIntegrityCheck } from "../../services/ledger.service.js";
 import { getPaymentAdapter } from "../../services/payment.adapter.js";
 import { emitToRoom } from "../../socket.js";
+import { env } from "../../env.js";
+import {
+  discoverBackups, runBackupScript, runRestoreScript,
+  isBackupCreateConfigured, isRestoreConfigured, isBackupDiscoveryConfigured,
+} from "../../lib/ops-infra.js";
+import { runHealthChecks, persistHealthResults, withTimeout, type HealthResult } from "../../lib/health-checks.js";
 import os from "node:os";
 
 /**
@@ -4410,4 +4427,1223 @@ export async function adminRoutes(app: FastifyInstance) {
     await writeAudit({ adminId: admin.id, req, action: "create_admin_user", entity: "admin_user", entityId: created.id, after: { username: created.username, role: input.roleKey, agencyId: input.agencyId ?? null } });
     return { ok: true, data: { id: created.id, username: created.username } };
   });
+
+  // =========================================================================
+  // Platform Operations, Monitoring, Maintenance & Backup (Prompt 12)
+  // =========================================================================
+  //
+  // Routes are organised in 10 groups, mirroring the admin UI tabs:
+  //   1. Operations dashboard
+  //   2. Health checks
+  //   3. Maintenance scheduling + activation
+  //   4. Backup management (discover / run / verify / delete)
+  //   5. Recovery (restore workflow, history)
+  //   6. Incident management
+  //   7. Operational alerts
+  //   8. System logs (read-only, redacted)
+  //   9. Background jobs / scheduled tasks
+  //  10. Operational reports (CSV export)
+  //
+  // All write operations land in the audit log. Every endpoint enforces
+  // a permission key (ops.*) on top of the existing auth check.
+
+  // --- 1. Operations dashboard ---------------------------------------------
+  app.get("/v1/admin/operations/dashboard", async (req) => {
+    await requireAdmin(req, "ops.view");
+    const now = new Date();
+    const last24h = new Date(now.getTime() - 86_400_000);
+
+    const [
+      activeMaintenance,
+      upcomingMaintenance,
+      openIncidents,
+      openAlerts,
+      latestBackups,
+      latestFailedBackups,
+      recentRecoveries,
+      apiErrors24h,
+      securityEvents24h,
+      auditActions24h,
+      healthSummary,
+    ] = await Promise.all([
+      prisma.maintenanceSchedule.findFirst({
+        where: { status: "active" },
+        orderBy: { activatedAt: "desc" },
+      }),
+      prisma.maintenanceSchedule.findMany({
+        where: { status: "scheduled", startAt: { gte: now } },
+        orderBy: { startAt: "asc" },
+        take: 5,
+      }),
+      prisma.operationalIncident.findMany({
+        where: { status: { in: ["open", "investigating", "identified", "monitoring"] } },
+        orderBy: { createdAt: "desc" },
+        take: 10,
+      }),
+      prisma.systemAlert.findMany({
+        where: { status: "open" },
+        orderBy: { createdAt: "desc" },
+        take: 10,
+      }),
+      prisma.backupRecord.findMany({
+        where: { status: { in: ["succeeded", "verified"] } },
+        orderBy: { completedAt: "desc" },
+        take: 5,
+      }),
+      prisma.backupRecord.findFirst({
+        where: { status: "failed" },
+        orderBy: { completedAt: "desc" },
+      }),
+      prisma.recoveryRecord.findMany({
+        orderBy: { createdAt: "desc" },
+        take: 5,
+      }),
+      prisma.apiErrorLog.count({ where: { createdAt: { gte: last24h } } }),
+      prisma.securityEvent.count({ where: { createdAt: { gte: last24h } } }),
+      prisma.auditLog.count({ where: { createdAt: { gte: last24h } } }),
+      // Latest health-check result per component
+      prisma.healthCheckResult.findMany({
+        where: { checkedAt: { gte: new Date(now.getTime() - 15 * 60_000) } },
+        orderBy: { checkedAt: "desc" },
+        take: 100,
+      }),
+    ]);
+
+    // Collapse health results to one row per component (latest only).
+    const latestByComponent = new Map<string, typeof healthSummary[number]>();
+    for (const h of healthSummary) {
+      if (!latestByComponent.has(h.component)) latestByComponent.set(h.component, h);
+    }
+    const health = [...latestByComponent.values()].map((h) => ({
+      component: h.component,
+      status: h.status,
+      responseTimeMs: h.responseTimeMs,
+      details: h.details,
+      checkedAt: h.checkedAt,
+    }));
+    const degraded = health.filter((h) => h.status === "degraded").length;
+    const down = health.filter((h) => h.status === "down").length;
+
+    // Determine overall platform health.
+    let platformHealth: "healthy" | "warning" | "critical" | "unknown" = "healthy";
+    if (down > 0 || openIncidents.some((i) => i.severity === "critical")) platformHealth = "critical";
+    else if (degraded > 0 || openIncidents.length > 0 || openAlerts.length > 0) platformHealth = "warning";
+    else if (health.length === 0) platformHealth = "unknown";
+
+    // Infrastructure status from process.* — real Node.js runtime data,
+    // NOT a fake uptime number.
+    const mem = process.memoryUsage();
+    const cpuUsage = process.cpuUsage();
+    const infra = {
+      uptimeSeconds: Math.floor(process.uptime()),
+      nodeVersion: process.version,
+      platform: `${os.platform()} ${os.arch()}`,
+      hostname: os.hostname(),
+      memory: {
+        rssMb: Math.round(mem.rss / 1024 / 1024),
+        heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+        heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
+        externalMb: Math.round(mem.external / 1024 / 1024),
+      },
+      cpu: { userMicros: cpuUsage.user, systemMicros: cpuUsage.system },
+      pid: process.pid,
+      loadAvg: os.loadavg(),
+      time: now.toISOString(),
+    };
+
+    // Active user sessions / rooms / game sessions — real counts from DB.
+    const [activeSessions, activeRooms, activeGameSessions] = await Promise.all([
+      prisma.session.count({ where: { revokedAt: null, expiresAt: { gt: now } } }),
+      prisma.room.count({ where: { closedAt: null } }),
+      prisma.gameSession.count({ where: { closedAt: null } }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        platformHealth,
+        generatedAt: now.toISOString(),
+        infra,
+        activeSessions,
+        activeRooms,
+        activeGameSessions,
+        apiErrors24h,
+        securityEvents24h,
+        auditActions24h,
+        activeMaintenance,
+        upcomingMaintenance,
+        openIncidents,
+        openAlerts,
+        latestBackups: latestBackups.map((b) => ({
+          id: b.id, kind: b.kind, status: b.status, completedAt: b.completedAt, sizeBytes: b.sizeBytes,
+        })),
+        latestFailedBackup: latestFailedBackups ? {
+          id: latestFailedBackups.id, kind: latestFailedBackups.kind, completedAt: latestFailedBackups.completedAt, error: latestFailedBackups.error,
+        } : null,
+        recentRecoveries: recentRecoveries.map((r) => ({
+          id: r.id, status: r.status, targetEnvironment: r.targetEnvironment, completedAt: r.completedAt,
+        })),
+        health,
+        backupCapabilities: {
+          discoveryConfigured: isBackupDiscoveryConfigured(),
+          createConfigured: isBackupCreateConfigured(),
+          restoreConfigured: isRestoreConfigured(),
+        },
+        maintenanceStrict: env.MAINTENANCE_STRICT === "true",
+      },
+    };
+  });
+
+  // --- 2. Health checks ----------------------------------------------------
+  app.get("/v1/admin/operations/health", async (req) => {
+    await requireAdmin(req, "ops.view");
+    // Return the latest persisted result per component. We do NOT re-run
+    // probes on every read — they would amplify load on Redis / DB.
+    const cutoff = new Date(Date.now() - 15 * 60_000);
+    const rows = await prisma.healthCheckResult.findMany({
+      where: { checkedAt: { gte: cutoff } },
+      orderBy: { checkedAt: "desc" },
+      take: 200,
+    });
+    const latestByComponent = new Map<string, typeof rows[number]>();
+    for (const r of rows) {
+      if (!latestByComponent.has(r.component)) latestByComponent.set(r.component, r);
+    }
+    return {
+      ok: true,
+      data: {
+        checks: [...latestByComponent.values()],
+        generatedAt: new Date().toISOString(),
+        lastRefresh: rows[0]?.checkedAt ?? null,
+      },
+    };
+  });
+
+  /** Run all probes and persist the results. Heavy-ish endpoint (calls
+   *  Redis, BullMQ, Prisma); rate-limited to 10/min per admin. */
+  app.post("/v1/admin/operations/health/run", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req) => {
+    const admin = await requireAdmin(req, "ops.view");
+    const results: HealthResult[] = await runHealthChecks();
+    await persistHealthResults(results);
+    await writeAudit({
+      adminId: admin.id, req,
+      action: "run_health_checks", entity: "operations", entityId: "health",
+      after: { count: results.length, down: results.filter((r) => r.status === "down").length },
+    });
+    return { ok: true, data: { checks: results, generatedAt: new Date().toISOString() } };
+  });
+
+  // --- 3. Maintenance ------------------------------------------------------
+  app.get("/v1/admin/operations/maintenance", async (req) => {
+    await requireAdmin(req, "ops.view");
+    const q = validate(maintenanceListQuerySchema, queryOf(req));
+    const where: Prisma.MaintenanceScheduleWhereInput = {};
+    if (q.scope) where.scope = q.scope;
+    if (q.status) where.status = q.status;
+    if (q.from || q.to) {
+      where.startAt = {};
+      if (q.from) where.startAt.gte = new Date(`${q.from}T00:00:00.000Z`);
+      if (q.to) where.startAt.lte = new Date(`${q.to}T23:59:59.999Z`);
+    }
+    const [total, items] = await Promise.all([
+      prisma.maintenanceSchedule.count({ where }),
+      prisma.maintenanceSchedule.findMany({
+        where,
+        include: {
+          events: { orderBy: { createdAt: "desc" }, take: 5 },
+          createdBy: { select: { id: true, username: true, displayName: true } },
+        },
+        orderBy: { startAt: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return { ok: true, data: { total, items } };
+  });
+
+  app.get("/v1/admin/operations/maintenance/:id", async (req) => {
+    await requireAdmin(req, "ops.view");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const schedule = await prisma.maintenanceSchedule.findUnique({
+      where: { id },
+      include: {
+        events: { orderBy: { createdAt: "asc" } },
+        createdBy: { select: { id: true, username: true, displayName: true } },
+        scheduledBy: { select: { id: true, username: true, displayName: true } },
+      },
+    });
+    if (!schedule) throw notFound();
+    return { ok: true, data: schedule };
+  });
+
+  app.post("/v1/admin/operations/maintenance", async (req) => {
+    const admin = await requireAdmin(req, "ops.maintenance");
+    const input = validate(maintenanceCreateSchema, bodyOf(req));
+    if (input.endAt <= input.startAt) throw badRequest("`endAt` must be after `startAt`");
+    // Reject conflicting schedules for the same scope — only one active at a time per scope.
+    const conflicting = await prisma.maintenanceSchedule.findFirst({
+      where: {
+        scope: input.scope,
+        status: { in: ["scheduled", "active"] },
+        OR: [
+          { startAt: { lt: input.endAt }, endAt: { gt: input.startAt } },
+        ],
+      },
+    });
+    if (conflicting) throw conflict(`a ${conflicting.status} ${input.scope} maintenance window already covers part of the requested range`);
+
+    const schedule = await prisma.maintenanceSchedule.create({
+      data: {
+        scope: input.scope,
+        title: input.title,
+        message: input.message,
+        status: "scheduled",
+        startAt: input.startAt,
+        endAt: input.endAt,
+        internalNotes: input.internalNotes,
+        createdById: admin.id,
+        scheduledById: admin.id,
+      },
+    });
+    await prisma.maintenanceEvent.create({
+      data: { maintenanceId: schedule.id, type: "created", note: input.reason, adminId: admin.id },
+    });
+    await writeAudit({
+      adminId: admin.id, req,
+      action: "create_maintenance", entity: "maintenance_schedule", entityId: schedule.id,
+      after: { scope: schedule.scope, title: schedule.title, startAt: schedule.startAt, endAt: schedule.endAt, reason: input.reason },
+    });
+    return { ok: true, data: schedule };
+  });
+
+  app.patch("/v1/admin/operations/maintenance/:id", async (req) => {
+    const admin = await requireAdmin(req, "ops.maintenance");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const input = validate(maintenanceUpdateSchema, bodyOf(req));
+    const existing = await prisma.maintenanceSchedule.findUnique({ where: { id } });
+    if (!existing) throw notFound();
+    if (existing.status === "completed" || existing.status === "cancelled") {
+      throw badRequest(`cannot edit a ${existing.status} maintenance window`);
+    }
+    if (input.startAt && input.endAt && input.endAt <= input.startAt) throw badRequest("`endAt` must be after `startAt`");
+    const updated = await prisma.maintenanceSchedule.update({
+      where: { id },
+      data: {
+        ...(input.title !== undefined && { title: input.title }),
+        ...(input.message !== undefined && { message: input.message }),
+        ...(input.startAt !== undefined && { startAt: input.startAt }),
+        ...(input.endAt !== undefined && { endAt: input.endAt }),
+        ...(input.internalNotes !== undefined && { internalNotes: input.internalNotes }),
+      },
+    });
+    await prisma.maintenanceEvent.create({
+      data: { maintenanceId: id, type: "updated", note: "schedule fields updated", adminId: admin.id },
+    });
+    await writeAudit({
+      adminId: admin.id, req,
+      action: "update_maintenance", entity: "maintenance_schedule", entityId: id,
+      before: { title: existing.title, startAt: existing.startAt, endAt: existing.endAt },
+      after: input,
+    });
+    return { ok: true, data: updated };
+  });
+
+  app.post("/v1/admin/operations/maintenance/:id/action", async (req) => {
+    const admin = await requireAdmin(req, "ops.maintenance");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const input = validate(maintenanceActionSchema, bodyOf(req));
+    const existing = await prisma.maintenanceSchedule.findUnique({ where: { id } });
+    if (!existing) throw notFound();
+
+    let newStatus = existing.status;
+    let eventType: typeof MAINTENANCE_EVENT_TYPES[number] | null = null;
+    if (input.action === "activate") {
+      if (existing.status !== "scheduled") throw badRequest(`can only activate from 'scheduled' (currently '${existing.status}')`);
+      // Deactivate any other active maintenance for the same scope first.
+      await prisma.maintenanceSchedule.updateMany({
+        where: { scope: existing.scope, status: "active", id: { not: id } },
+        data: { status: "completed", completedAt: new Date() },
+      });
+      newStatus = "active";
+      eventType = "started";
+    } else if (input.action === "deactivate") {
+      if (existing.status !== "active") throw badRequest(`can only deactivate from 'active' (currently '${existing.status}')`);
+      newStatus = "completed";
+      eventType = "ended";
+    } else if (input.action === "cancel") {
+      if (existing.status === "completed" || existing.status === "cancelled") {
+        throw badRequest(`cannot cancel a ${existing.status} maintenance window`);
+      }
+      newStatus = "cancelled";
+      eventType = "cancelled";
+    }
+
+    const updates: Prisma.MaintenanceScheduleUpdateInput = { status: newStatus };
+    if (input.action === "activate") updates.activatedAt = new Date();
+    if (input.action === "deactivate") updates.completedAt = new Date();
+    if (input.action === "cancel") updates.cancelledAt = new Date();
+
+    const updated = await prisma.maintenanceSchedule.update({ where: { id }, data: updates });
+    if (eventType) {
+      await prisma.maintenanceEvent.create({
+        data: { maintenanceId: id, type: eventType, note: input.reason, adminId: admin.id },
+      });
+    }
+    await writeAudit({
+      adminId: admin.id, req,
+      action: `${input.action}_maintenance`, entity: "maintenance_schedule", entityId: id,
+      before: { status: existing.status },
+      after: { status: newStatus, reason: input.reason },
+    });
+    return { ok: true, data: updated };
+  });
+
+  // --- 4. Backups ----------------------------------------------------------
+  app.get("/v1/admin/operations/backups", async (req) => {
+    await requireAdmin(req, "ops.backups");
+    const q = validate(backupListQuerySchema, queryOf(req));
+    const where: Prisma.BackupRecordWhereInput = {};
+    if (q.kind) where.kind = q.kind;
+    if (q.status) where.status = q.status;
+    if (q.from || q.to) {
+      where.createdAt = {};
+      if (q.from) where.createdAt.gte = new Date(`${q.from}T00:00:00.000Z`);
+      if (q.to) where.createdAt.lte = new Date(`${q.to}T23:59:59.999Z`);
+    }
+    const [total, items] = await Promise.all([
+      prisma.backupRecord.count({ where }),
+      prisma.backupRecord.findMany({
+        where,
+        include: { createdBy: { select: { id: true, username: true, displayName: true } } },
+        orderBy: { createdAt: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total,
+        items,
+        capabilities: {
+          discoveryConfigured: isBackupDiscoveryConfigured(),
+          createConfigured: isBackupCreateConfigured(),
+        },
+      },
+    };
+  });
+
+  /**
+   * Discover existing backup files on disk and reconcile them with the
+   * `BackupRecord` table. Files that match `sm_live_*.sql.gz` inside
+   * `BACKUP_DIR_PATH` are upserted (matched on checksum). Files that
+   * exist on disk but not in DB get a new `succeeded` row. The endpoint
+   * is read-only relative to the filesystem — no files are created or
+   * deleted here.
+   */
+  app.post("/v1/admin/operations/backups/discover", { config: { rateLimit: { max: 6, timeWindow: "1 minute" } } }, async (req) => {
+    const admin = await requireAdmin(req, "ops.backups");
+    if (!isBackupDiscoveryConfigured()) throw notConfigured("backup discovery not configured (BACKUP_DIR_PATH unset)");
+    const discovered = await discoverBackups();
+    let created = 0, updated = 0, unchanged = 0;
+    for (const d of discovered) {
+      const existing = await prisma.backupRecord.findFirst({
+        where: { OR: [{ checksum: d.checksum }, { location: d.location }] },
+      });
+      if (existing) {
+        if (existing.status !== "succeeded" && existing.status !== "verified") {
+          await prisma.backupRecord.update({
+            where: { id: existing.id },
+            data: {
+              status: "succeeded",
+              sizeBytes: d.sizeBytes,
+              checksum: d.checksum,
+              completedAt: d.modifiedAt,
+              startedAt: d.modifiedAt,
+              location: d.location,
+              error: "",
+            },
+          });
+          updated++;
+        } else {
+          unchanged++;
+        }
+      } else {
+        await prisma.backupRecord.create({
+          data: {
+            kind: "database",
+            scope: "platform",
+            status: "succeeded",
+            location: d.location,
+            sizeBytes: d.sizeBytes,
+            checksum: d.checksum,
+            startedAt: d.modifiedAt,
+            completedAt: d.modifiedAt,
+            note: "auto-discovered from filesystem",
+            meta: { filename: d.filename, discoveredAt: new Date().toISOString() } as unknown as Prisma.InputJsonValue,
+          },
+        });
+        created++;
+      }
+    }
+    await writeAudit({
+      adminId: admin.id, req,
+      action: "discover_backups", entity: "backup_record", entityId: null,
+      after: { discovered: discovered.length, created, updated, unchanged },
+    });
+    return { ok: true, data: { discovered: discovered.length, created, updated, unchanged } };
+  });
+
+  /**
+   * Trigger a backup by invoking `BACKUP_SCRIPT_PATH`. Records the run as
+   * a `pending` → `running` → `succeeded` / `failed` row. The script
+   * must produce exactly one new file in `BACKUP_DIR_PATH` matching the
+   * canonical pattern; otherwise we surface `succeeded` with a warning
+   * that no new file was detected.
+   */
+  app.post("/v1/admin/operations/backups/run", { config: { rateLimit: { max: 3, timeWindow: "1 minute" } } }, async (req) => {
+    const admin = await requireAdmin(req, "ops.backups.write");
+    const input = validate(backupCreateSchema, bodyOf(req));
+    if (!isBackupCreateConfigured()) throw notConfigured("backup creation not configured (BACKUP_SCRIPT_PATH unset)");
+
+    // Snapshot the existing backup files BEFORE the run so we can detect
+    // the new file even if the script doesn't print its path.
+    const before = await discoverBackups();
+    const beforeSet = new Set(before.map((b) => b.checksum));
+
+    const record = await prisma.backupRecord.create({
+      data: {
+        kind: input.kind, scope: "platform", status: "running",
+        startedAt: new Date(), createdById: admin.id, note: input.note,
+      },
+    });
+
+    try {
+      const result = await runBackupScript();
+      const after = await discoverBackups();
+      const newFiles = after.filter((b) => !beforeSet.has(b.checksum));
+      if (newFiles.length === 0) {
+        // Script exited 0 but we couldn't find a new file — surface as
+        // a degraded success so the admin can investigate.
+        const updated = await prisma.backupRecord.update({
+          where: { id: record.id },
+          data: {
+            status: "failed",
+            completedAt: new Date(),
+            error: "script exited 0 but no new backup file was detected",
+            meta: { stdout: result.stdout.slice(0, 2000), stderr: result.stderr.slice(0, 2000), durationMs: result.durationMs } as unknown as Prisma.InputJsonValue,
+          },
+        });
+        await writeAudit({
+          adminId: admin.id, req, action: "run_backup", entity: "backup_record", entityId: record.id,
+          after: { status: "failed", reason: "no new file detected" },
+        });
+        return { ok: true, data: updated };
+      }
+      const f = newFiles[0]!;
+      const updated = await prisma.backupRecord.update({
+        where: { id: record.id },
+        data: {
+          status: "succeeded",
+          completedAt: new Date(),
+          location: f.location,
+          sizeBytes: f.sizeBytes,
+          checksum: f.checksum,
+          meta: { filename: f.filename, durationMs: result.durationMs, stdout: result.stdout.slice(0, 1000), stderr: result.stderr.slice(0, 1000) } as unknown as Prisma.InputJsonValue,
+        },
+      });
+      await writeAudit({
+        adminId: admin.id, req, action: "run_backup", entity: "backup_record", entityId: record.id,
+        after: { status: "succeeded", location: f.location, sizeBytes: f.sizeBytes, durationMs: result.durationMs },
+      });
+      return { ok: true, data: updated };
+    } catch (e) {
+      const err = e as Error & { code?: string; stdout?: string; stderr?: string };
+      await prisma.backupRecord.update({
+        where: { id: record.id },
+        data: {
+          status: "failed",
+          completedAt: new Date(),
+          error: err.message.slice(0, 500),
+          meta: { stdout: (err.stdout ?? "").slice(0, 2000), stderr: (err.stderr ?? "").slice(0, 2000) } as unknown as Prisma.InputJsonValue,
+        },
+      });
+      await writeAudit({
+        adminId: admin.id, req, action: "run_backup", entity: "backup_record", entityId: record.id,
+        after: { status: "failed", error: err.message },
+      });
+      // Don't leak script internals to the API response — return a clean error.
+      if (err.code === "not_configured") throw notConfigured(err.message);
+      throw badRequest(`backup script failed: ${err.message}`);
+    }
+  });
+
+  app.post("/v1/admin/operations/backups/:id/verify", async (req) => {
+    const admin = await requireAdmin(req, "ops.backups.write");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const input = validate(backupVerifySchema, bodyOf(req));
+    const existing = await prisma.backupRecord.findUnique({ where: { id } });
+    if (!existing) throw notFound();
+    if (existing.status !== "succeeded") throw badRequest(`only 'succeeded' backups can be verified (currently '${existing.status}')`);
+    const updated = await prisma.backupRecord.update({
+      where: { id },
+      data: { status: "verified", note: existing.note ? `${existing.note}\n${input.note}` : input.note },
+    });
+    await writeAudit({
+      adminId: admin.id, req, action: "verify_backup", entity: "backup_record", entityId: id,
+      before: { status: "succeeded" }, after: { status: "verified", note: input.note },
+    });
+    return { ok: true, data: updated };
+  });
+
+  app.delete("/v1/admin/operations/backups/:id", async (req) => {
+    const admin = await requireAdmin(req, "ops.backups.write");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const input = validate(backupDeleteSchema, bodyOf(req));
+    const existing = await prisma.backupRecord.findUnique({ where: { id } });
+    if (!existing) throw notFound();
+    // Only expired or failed backups may be deleted.
+    if (existing.status !== "expired" && existing.status !== "failed") {
+      throw badRequest(`only 'expired' or 'failed' backups can be deleted (currently '${existing.status}')`);
+    }
+    // Protect the last verified backup of each kind.
+    const lastVerified = await prisma.backupRecord.findFirst({
+      where: { kind: existing.kind, status: "verified" },
+      orderBy: { completedAt: "desc" },
+    });
+    if (lastVerified && lastVerified.id === existing.id) {
+      throw forbidden("cannot delete the last verified backup of this kind");
+    }
+    const updated = await prisma.backupRecord.update({
+      where: { id },
+      data: { status: "deleted", note: `${existing.note}\n[deleted by ${admin.username}: ${input.reason}]` },
+    });
+    await writeAudit({
+      adminId: admin.id, req, action: "delete_backup", entity: "backup_record", entityId: id,
+      before: { status: existing.status }, after: { status: "deleted", reason: input.reason },
+    });
+    return { ok: true, data: updated };
+  });
+
+  // --- 5. Recovery ---------------------------------------------------------
+  app.get("/v1/admin/operations/recoveries", async (req) => {
+    await requireAdmin(req, "ops.restore");
+    const q = validate(paginationQuery, queryOf(req));
+    const [total, items] = await Promise.all([
+      prisma.recoveryRecord.count(),
+      prisma.recoveryRecord.findMany({
+        include: {
+          backup: { select: { id: true, kind: true, location: true, status: true, completedAt: true } },
+          requestedBy: { select: { id: true, username: true, displayName: true } },
+        },
+        orderBy: { createdAt: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return { ok: true, data: { total, items } };
+  });
+
+  app.post("/v1/admin/operations/recoveries", { config: { rateLimit: { max: 2, timeWindow: "1 minute" } } }, async (req) => {
+    const admin = await requireAdmin(req, "ops.restore");
+    const input = validate(recoveryCreateSchema, bodyOf(req));
+    if (input.confirm !== true) throw badRequest("`confirm: true` is required to start a recovery");
+
+    const backup = await prisma.backupRecord.findUnique({ where: { id: input.backupId } });
+    if (!backup) throw notFound("backup not found");
+    // Only verified backups are eligible for restore.
+    if (backup.status !== "verified") {
+      throw badRequest(`only 'verified' backups can be restored (currently '${backup.status}')`);
+    }
+
+    const record = await prisma.recoveryRecord.create({
+      data: {
+        backupId: backup.id,
+        status: "running",
+        targetEnvironment: input.targetEnvironment,
+        impact: `overwrites all tables in the ${input.targetEnvironment} environment`,
+        notes: input.notes,
+        requestedById: admin.id,
+        startedAt: new Date(),
+      },
+    });
+
+    if (!isRestoreConfigured()) {
+      // Mark as cancelled with a clear note — we never persist a fake
+      // "succeeded" recovery when no script is wired up.
+      const cancelled = await prisma.recoveryRecord.update({
+        where: { id: record.id },
+        data: {
+          status: "cancelled",
+          completedAt: new Date(),
+          result: "RESTORE_SCRIPT_PATH not configured — restore must be performed manually (see infra/restore.sh)",
+        },
+      });
+      await writeAudit({
+        adminId: admin.id, req, action: "request_restore", entity: "recovery_record", entityId: record.id,
+        after: { status: "cancelled", reason: "RESTORE_SCRIPT_PATH unset" },
+      });
+      return { ok: true, data: cancelled };
+    }
+
+    try {
+      const result = await runRestoreScript(backup.location, input.targetEnvironment);
+      const updated = await prisma.recoveryRecord.update({
+        where: { id: record.id },
+        data: {
+          status: "succeeded",
+          completedAt: new Date(),
+          result: `restore script exited 0 in ${result.durationMs}ms`,
+        },
+      });
+      await writeAudit({
+        adminId: admin.id, req, action: "request_restore", entity: "recovery_record", entityId: record.id,
+        after: { status: "succeeded", targetEnvironment: input.targetEnvironment, backupId: backup.id, durationMs: result.durationMs },
+      });
+      return { ok: true, data: updated };
+    } catch (e) {
+      const err = e as Error & { code?: string; stdout?: string; stderr?: string };
+      await prisma.recoveryRecord.update({
+        where: { id: record.id },
+        data: {
+          status: "failed",
+          completedAt: new Date(),
+          result: err.message.slice(0, 500),
+        },
+      });
+      await writeAudit({
+        adminId: admin.id, req, action: "request_restore", entity: "recovery_record", entityId: record.id,
+        after: { status: "failed", error: err.message },
+      });
+      if (err.code === "forbidden_target") throw forbidden(err.message);
+      throw badRequest(`restore script failed: ${err.message}`);
+    }
+  });
+
+  // --- 6. Incidents --------------------------------------------------------
+  app.get("/v1/admin/operations/incidents", async (req) => {
+    await requireAdmin(req, "ops.incidents");
+    const q = validate(incidentListQuerySchema, queryOf(req));
+    const where: Prisma.OperationalIncidentWhereInput = {};
+    if (q.status) where.status = q.status;
+    if (q.severity) where.severity = q.severity;
+    if (q.assigneeId) where.assigneeId = q.assigneeId;
+    if (q.search) {
+      where.OR = [
+        { title: { contains: q.search, mode: "insensitive" } },
+        { affectedService: { contains: q.search, mode: "insensitive" } },
+      ];
+    }
+    const [total, items] = await Promise.all([
+      prisma.operationalIncident.count({ where }),
+      prisma.operationalIncident.findMany({
+        where,
+        include: {
+          assignee: { select: { id: true, username: true, displayName: true } },
+          createdBy: { select: { id: true, username: true, displayName: true } },
+        },
+        orderBy: { createdAt: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return { ok: true, data: { total, items } };
+  });
+
+  app.get("/v1/admin/operations/incidents/:id", async (req) => {
+    await requireAdmin(req, "ops.incidents");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const incident = await prisma.operationalIncident.findUnique({
+      where: { id },
+      include: {
+        assignee: { select: { id: true, username: true, displayName: true } },
+        createdBy: { select: { id: true, username: true, displayName: true } },
+      },
+    });
+    if (!incident) throw notFound();
+    return { ok: true, data: incident };
+  });
+
+  app.post("/v1/admin/operations/incidents", async (req) => {
+    const admin = await requireAdmin(req, "ops.incidents");
+    const input = validate(incidentCreateSchema, bodyOf(req));
+    if (input.assigneeId) {
+      const assignee = await prisma.adminUser.findUnique({ where: { id: input.assigneeId } });
+      if (!assignee || !assignee.active) throw badRequest("assignee not found or inactive");
+    }
+    const incident = await prisma.operationalIncident.create({
+      data: {
+        title: input.title,
+        description: input.description,
+        severity: input.severity,
+        affectedService: input.affectedService,
+        assigneeId: input.assigneeId ?? null,
+        createdById: admin.id,
+      },
+    });
+    await writeAudit({
+      adminId: admin.id, req, action: "create_incident", entity: "operational_incident", entityId: incident.id,
+      after: { title: input.title, severity: input.severity, affectedService: input.affectedService },
+    });
+    return { ok: true, data: incident };
+  });
+
+  app.patch("/v1/admin/operations/incidents/:id", async (req) => {
+    const admin = await requireAdmin(req, "ops.incidents");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const input = validate(incidentUpdateSchema, bodyOf(req));
+    const existing = await prisma.operationalIncident.findUnique({ where: { id } });
+    if (!existing) throw notFound();
+    if (input.assigneeId) {
+      const assignee = await prisma.adminUser.findUnique({ where: { id: input.assigneeId } });
+      if (!assignee || !assignee.active) throw badRequest("assignee not found or inactive");
+    }
+    const updates: Prisma.OperationalIncidentUpdateInput = {};
+    if (input.title !== undefined) updates.title = input.title;
+    if (input.description !== undefined) updates.description = input.description;
+    if (input.severity !== undefined) updates.severity = input.severity;
+    if (input.status !== undefined) {
+      updates.status = input.status;
+      if (input.status === "closed") updates.closedAt = new Date();
+    }
+    if (input.affectedService !== undefined) updates.affectedService = input.affectedService;
+    if (input.assigneeId !== undefined) updates.assignee = input.assigneeId ? { connect: { id: input.assigneeId } } : { disconnect: true };
+    if (input.internalNotes !== undefined) updates.internalNotes = input.internalNotes;
+    if (input.resolutionDetails !== undefined) updates.resolutionDetails = input.resolutionDetails;
+
+    const updated = await prisma.operationalIncident.update({ where: { id }, data: updates });
+    await writeAudit({
+      adminId: admin.id, req, action: "update_incident", entity: "operational_incident", entityId: id,
+      before: { status: existing.status, severity: existing.severity, assigneeId: existing.assigneeId },
+      after: input,
+    });
+    return { ok: true, data: updated };
+  });
+
+  // --- 7. Alerts -----------------------------------------------------------
+  app.get("/v1/admin/operations/alerts", async (req) => {
+    await requireAdmin(req, "ops.incidents");
+    const q = validate(alertListQuerySchema, queryOf(req));
+    const where: Prisma.SystemAlertWhereInput = {};
+    if (q.status) where.status = q.status;
+    if (q.severity) where.severity = q.severity;
+    if (q.source) where.source = q.source;
+    const [total, items] = await Promise.all([
+      prisma.systemAlert.count({ where }),
+      prisma.systemAlert.findMany({
+        where,
+        include: {
+          ackedBy: { select: { id: true, username: true, displayName: true } },
+          resolvedBy: { select: { id: true, username: true, displayName: true } },
+        },
+        orderBy: { createdAt: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return { ok: true, data: { total, items } };
+  });
+
+  app.post("/v1/admin/operations/alerts/:id/ack", async (req) => {
+    const admin = await requireAdmin(req, "ops.incidents");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const input = validate(alertAckSchema, bodyOf(req));
+    const existing = await prisma.systemAlert.findUnique({ where: { id } });
+    if (!existing) throw notFound();
+    if (existing.status !== "open") throw badRequest(`can only ack 'open' alerts (currently '${existing.status}')`);
+    const updated = await prisma.systemAlert.update({
+      where: { id },
+      data: { status: "acknowledged", ackedById: admin.id, acknowledgedAt: new Date(), resolutionNotes: input.note ? `ack: ${input.note}` : "" },
+    });
+    await writeAudit({
+      adminId: admin.id, req, action: "ack_alert", entity: "system_alert", entityId: id,
+      before: { status: "open" }, after: { status: "acknowledged", note: input.note },
+    });
+    return { ok: true, data: updated };
+  });
+
+  app.post("/v1/admin/operations/alerts/:id/resolve", async (req) => {
+    const admin = await requireAdmin(req, "ops.incidents");
+    const { id } = validate(z.object({ id: z.coerce.number().int().positive() }), paramsOf(req));
+    const input = validate(alertResolveSchema, bodyOf(req));
+    const existing = await prisma.systemAlert.findUnique({ where: { id } });
+    if (!existing) throw notFound();
+    if (existing.status === "resolved") throw badRequest("alert already resolved");
+    const updated = await prisma.systemAlert.update({
+      where: { id },
+      data: {
+        status: "resolved",
+        resolvedById: admin.id,
+        resolvedAt: new Date(),
+        resolutionNotes: input.resolutionNotes,
+        ...(existing.ackedById == null && { ackedById: admin.id, acknowledgedAt: new Date() }),
+      },
+    });
+    await writeAudit({
+      adminId: admin.id, req, action: "resolve_alert", entity: "system_alert", entityId: id,
+      before: { status: existing.status }, after: { status: "resolved", resolutionNotes: input.resolutionNotes },
+    });
+    return { ok: true, data: updated };
+  });
+
+  // --- 8. System logs (read-only, redacted) --------------------------------
+  app.get("/v1/admin/operations/logs", async (req) => {
+    await requireAdmin(req, "ops.logs");
+    const q = validate(logListQuerySchema, queryOf(req));
+    const where: Prisma.ApiErrorLogWhereInput = {};
+    if (q.from || q.to) {
+      where.createdAt = {};
+      if (q.from) where.createdAt.gte = new Date(`${q.from}T00:00:00.000Z`);
+      if (q.to) where.createdAt.lte = new Date(`${q.to}T23:59:59.999Z`);
+    }
+    if (q.search) where.message = { contains: q.search, mode: "insensitive" };
+    if (q.service) {
+      // Map our LOG_SERVICES enum onto the ApiErrorLog.source column.
+      // We only surface logs from sources we know how to attribute.
+      const serviceToSource: Record<string, string[]> = {
+        api: ["admin", "v1", "provider"],
+        database: ["database", "prisma"],
+        provider: ["provider"],
+        webhook: ["webhook"],
+        wallet: ["wallet"],
+      };
+      where.source = { in: serviceToSource[q.service] ?? [q.service] };
+    }
+    // Note: ApiErrorLog does not have a `level` column — we synthesise one
+    // server-side from the message content (heuristic, surfaced as `level`
+    // in the response). This is documented in the response payload.
+    const [total, items] = await Promise.all([
+      prisma.apiErrorLog.count({ where }),
+      prisma.apiErrorLog.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    // Redact any payload fields that look like credentials.
+    const redacted = items.map((i) => ({
+      id: i.id,
+      level: i.source === "webhook" ? "warn" : "error",
+      service: i.source,
+      route: i.route,
+      message: i.message,
+      payload: redactPayload(i.payload),
+      createdAt: i.createdAt,
+    }));
+    return {
+      ok: true,
+      data: {
+        total,
+        items: redacted,
+        note: "System logs surface ApiErrorLog rows. Application logs (pino) are NOT exposed via the API — use the server's log shipper (e.g. vector / fluentd) for full-text log search.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/operations/audit", async (req) => {
+    await requireAdmin(req, "ops.logs");
+    const q = validate(paginationQuery.extend({
+      action: z.string().trim().max(80).optional(),
+      entity: z.string().trim().max(80).optional(),
+      adminId: z.coerce.number().int().positive().optional(),
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    }), queryOf(req));
+    const where: Prisma.AuditLogWhereInput = {};
+    if (q.action) where.action = { contains: q.action, mode: "insensitive" };
+    if (q.entity) where.entity = q.entity;
+    if (q.adminId) where.adminId = q.adminId;
+    if (q.from || q.to) {
+      where.createdAt = {};
+      if (q.from) where.createdAt.gte = new Date(`${q.from}T00:00:00.000Z`);
+      if (q.to) where.createdAt.lte = new Date(`${q.to}T23:59:59.999Z`);
+    }
+    const [total, items] = await Promise.all([
+      prisma.auditLog.count({ where }),
+      prisma.auditLog.findMany({
+        where,
+        include: { admin: { select: { id: true, username: true, displayName: true } } },
+        orderBy: { createdAt: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return { ok: true, data: { total, items } };
+  });
+
+  // --- 9. Background jobs / scheduled tasks -------------------------------
+  app.get("/v1/admin/operations/jobs", async (req) => {
+    await requireAdmin(req, "ops.jobs");
+    const q = validate(jobListQuerySchema, queryOf(req));
+    // BullMQ stores job state in Redis — we probe the queue directly so
+    // the dashboard reflects the live queue, not a DB snapshot.
+    type JobSummary = {
+      id: string; name: string; status: string; attempts: number;
+      createdAt?: number; processedAt?: number; finishedAt?: number;
+      lastFailedReason?: string; nextRepeat?: string | null;
+    };
+    let jobs: JobSummary[] = [];
+    let scheduled: Array<{ name: string; pattern?: string; every?: number; next?: string }> = [];
+    let queueError: string | null = null;
+    try {
+      const { default: BullMQ } = await import("bullmq");
+      type QueueLike = {
+        getJobs: (states: string[], start?: number, end?: number, asc?: boolean) => Promise<unknown[]>;
+        getRepeatableJobs: () => Promise<unknown[]>;
+        close?: () => Promise<unknown>;
+      };
+      const Queue = (BullMQ as unknown as { Queue: new (name: string, opts: unknown) => QueueLike }).Queue;
+      const queue = new Queue("sm-live-jobs", { connection: (await import("../../lib/redis.js")).redis.duplicate() });
+      const states = q.status ? [q.status] : ["waiting", "active", "completed", "failed", "delayed"];
+      // Wrap each BullMQ call in a timeout so a missing Redis doesn't
+      // hang the dashboard. 1.5s is enough for any healthy queue probe.
+      const all = await withTimeout(queue.getJobs(states as string[], 0, 100, false) as Promise<unknown[]>, 1500, "queue probe timed out") as Array<{
+        id: string; name: string; attemptsMade: number; timestamp?: number;
+        processedOn?: number; finishedOn?: number; failedReason?: string; opts?: { repeat?: unknown };
+      }>;
+      const repeatable = await withTimeout(queue.getRepeatableJobs(), 1500, "repeatable probe timed out") as Array<{ key: string; name: string; pattern?: string; every?: number; next?: number }>;
+      const repeatMap = new Map(repeatable.map((r) => [r.name, r]));
+      jobs = all.map((j) => {
+        const rep = repeatMap.get(j.name);
+        return {
+          id: j.id,
+          name: j.name,
+          status: j.finishedOn ? (j.failedReason ? "failed" : "completed") : (j.processedOn ? "active" : "waiting"),
+          attempts: j.attemptsMade,
+          createdAt: j.timestamp,
+          processedAt: j.processedOn,
+          finishedAt: j.finishedOn,
+          lastFailedReason: j.failedReason ? String(j.failedReason).slice(0, 500) : undefined,
+          nextRepeat: rep?.next ? new Date(rep.next).toISOString() : null,
+        };
+      });
+      scheduled = repeatable.map((r) => ({
+        name: r.name,
+        pattern: r.pattern,
+        every: r.every,
+        next: r.next ? new Date(r.next).toISOString() : undefined,
+      }));
+      if (typeof queue.close === "function") await queue.close().catch(() => {});
+    } catch (e) {
+      queueError = (e as Error).message;
+    }
+    return {
+      ok: true,
+      data: {
+        jobs: jobs.slice((q.page - 1) * q.pageSize, (q.page - 1) * q.pageSize + q.pageSize),
+        scheduled,
+        queueError,
+        note: "Job state is read live from the BullMQ queue (Redis). The scheduler registers 5 repeat jobs at boot: recover-rounds (every 30s), daily-rollup (00:05), rtp-snapshot (hourly), monthly-fees (1st 00:20), provider-bills (1st 00:30).",
+      },
+    };
+  });
+
+  /**
+   * Retry a failed job. Financial / wallet / payout jobs CANNOT be retried
+   * from this endpoint — they must be re-driven through the original
+   * idempotent entry point so the existing txKey / providerTxId guards
+   * prevent double-debits. The deny-list is enforced server-side.
+   */
+  app.post("/v1/admin/operations/jobs/:id/retry", async (req) => {
+    const admin = await requireAdmin(req, "ops.jobs");
+    const { id } = validate(z.object({ id: z.string().min(1).max(120) }), paramsOf(req));
+    const input = validate(jobRetrySchema, bodyOf(req));
+
+    // Deny-list: jobs whose name matches these patterns cannot be retried
+    // from the admin UI. They must be re-driven through the original
+    // idempotent entry point (e.g. POST /v1/wallet/recharge, POST /v1/games/bet).
+    const DENY_LIST = [
+      /^payout/, /^wallet/, /^recharge/, /^refund/, /^bet/, /^settle/, /^provider-/,
+      /^monthly-fees/, /^provider-bills/,
+    ];
+
+    let jobName = "";
+    try {
+      const { default: BullMQ } = await import("bullmq");
+      type QueueLike = {
+        getJob: (id: string) => Promise<unknown> | null;
+        close?: () => Promise<unknown>;
+      };
+      const Queue = (BullMQ as unknown as { Queue: new (name: string, opts: unknown) => QueueLike }).Queue;
+      const queue = new Queue("sm-live-jobs", { connection: (await import("../../lib/redis.js")).redis.duplicate() });
+      const job = await withTimeout(queue.getJob(id) as Promise<unknown>, 1500, "queue probe timed out") as { name: string; retry: (state?: string) => Promise<unknown> } | null;
+      if (!job) {
+        if (typeof queue.close === "function") await queue.close().catch(() => {});
+        throw notFound("job not found in queue");
+      }
+      jobName = job.name;
+      if (DENY_LIST.some((re) => re.test(jobName))) {
+        if (typeof queue.close === "function") await queue.close().catch(() => {});
+        throw forbidden(`job '${jobName}' is on the financial deny-list — re-drive through the original idempotent entry point`);
+      }
+      await withTimeout(job.retry() as Promise<unknown>, 1500, "retry timed out");
+      if (typeof queue.close === "function") await queue.close().catch(() => {});
+    } catch (e) {
+      const msg = (e as Error).message ?? "";
+      if (msg.includes("not found")) throw notFound("job not found in queue");
+      if (msg.includes("forbidden")) throw forbidden(msg);
+      if (msg.includes("timed out")) throw badRequest(`retry failed: ${msg}`);
+      throw badRequest(`retry failed: ${msg}`);
+    }
+
+    await writeAudit({
+      adminId: admin.id, req, action: "retry_job", entity: "job", entityId: id,
+      after: { name: jobName, reason: input.reason },
+    });
+    return { ok: true, data: { id, name: jobName, retried: true } };
+  });
+
+  // --- 10. Operational reports (CSV export) --------------------------------
+  app.get("/v1/admin/operations/reports/export", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req, reply) => {
+    await requireAdmin(req, "ops.view");
+    const q = validate(z.object({
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      kind: z.enum(["incidents", "alerts", "maintenance", "backups", "recoveries", "audit", "api_errors"]).default("incidents"),
+    }), queryOf(req));
+
+    const dateFilter: Prisma.AdminUserWhereInput | Record<string, unknown> = {};
+    if (q.from || q.to) {
+      const range: Record<string, unknown> = {};
+      if (q.from) range.gte = new Date(`${q.from}T00:00:00.000Z`);
+      if (q.to) range.lte = new Date(`${q.to}T23:59:59.999Z`);
+      dateFilter.createdAt = range;
+    }
+
+    let rows: Record<string, unknown>[] = [];
+    switch (q.kind) {
+      case "incidents": {
+        const items = await prisma.operationalIncident.findMany({
+          where: dateFilter as Prisma.OperationalIncidentWhereInput,
+          orderBy: { createdAt: "desc" },
+          take: 1000,
+        });
+        rows = items.map((i) => ({
+          id: i.id, title: i.title, severity: i.severity, status: i.status,
+          affectedService: i.affectedService, createdAt: i.createdAt.toISOString(),
+          closedAt: i.closedAt?.toISOString() ?? "",
+        }));
+        break;
+      }
+      case "alerts": {
+        const items = await prisma.systemAlert.findMany({
+          where: dateFilter as Prisma.SystemAlertWhereInput,
+          orderBy: { createdAt: "desc" },
+          take: 1000,
+        });
+        rows = items.map((a) => ({
+          id: a.id, source: a.source, severity: a.severity, status: a.status,
+          message: a.message, occurrenceCount: a.occurrenceCount,
+          createdAt: a.createdAt.toISOString(), resolvedAt: a.resolvedAt?.toISOString() ?? "",
+        }));
+        break;
+      }
+      case "maintenance": {
+        const items = await prisma.maintenanceSchedule.findMany({
+          where: dateFilter as Prisma.MaintenanceScheduleWhereInput,
+          orderBy: { createdAt: "desc" },
+          take: 1000,
+        });
+        rows = items.map((m) => ({
+          id: m.id, scope: m.scope, title: m.title, status: m.status,
+          startAt: m.startAt.toISOString(), endAt: m.endAt.toISOString(),
+          activatedAt: m.activatedAt?.toISOString() ?? "",
+          completedAt: m.completedAt?.toISOString() ?? "",
+        }));
+        break;
+      }
+      case "backups": {
+        const items = await prisma.backupRecord.findMany({
+          where: dateFilter as Prisma.BackupRecordWhereInput,
+          orderBy: { createdAt: "desc" },
+          take: 1000,
+        });
+        rows = items.map((b) => ({
+          id: b.id, kind: b.kind, status: b.status, location: b.location,
+          sizeBytes: b.sizeBytes ?? 0, completedAt: b.completedAt?.toISOString() ?? "",
+          createdAt: b.createdAt.toISOString(),
+        }));
+        break;
+      }
+      case "recoveries": {
+        const items = await prisma.recoveryRecord.findMany({
+          where: dateFilter as Prisma.RecoveryRecordWhereInput,
+          orderBy: { createdAt: "desc" },
+          take: 1000,
+        });
+        rows = items.map((r) => ({
+          id: r.id, backupId: r.backupId, status: r.status,
+          targetEnvironment: r.targetEnvironment, completedAt: r.completedAt?.toISOString() ?? "",
+          createdAt: r.createdAt.toISOString(),
+        }));
+        break;
+      }
+      case "audit": {
+        const items = await prisma.auditLog.findMany({
+          where: dateFilter as Prisma.AuditLogWhereInput,
+          orderBy: { createdAt: "desc" },
+          take: 1000,
+        });
+        rows = items.map((a) => ({
+          id: a.id, adminId: a.adminId ?? "", action: a.action, entity: a.entity,
+          entityId: a.entityId ?? "", ip: a.ip, createdAt: a.createdAt.toISOString(),
+        }));
+        break;
+      }
+      case "api_errors": {
+        const items = await prisma.apiErrorLog.findMany({
+          where: dateFilter as Prisma.ApiErrorLogWhereInput,
+          orderBy: { createdAt: "desc" },
+          take: 1000,
+        });
+        rows = items.map((e) => ({
+          id: e.id, source: e.source, route: e.route, message: e.message,
+          createdAt: e.createdAt.toISOString(),
+        }));
+        break;
+      }
+    }
+
+    // CSV export — apply the existing formula-injection guard.
+    const csvEscape = (v: unknown): string => {
+      const s = v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      // Mitigate CSV formula injection: prefix cells starting with = + - @ \t \r
+      if (/^[=+\-@\t\r]/.test(s)) return `'${s}`;
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    if (rows.length === 0) {
+      return reply.status(200).header("content-type", "text/csv").header("content-disposition", `attachment; filename="operations-${q.kind}.csv"`).send("");
+    }
+    const cols = Object.keys(rows[0]!);
+    const csv = [cols.join(","), ...rows.map((r) => cols.map((c) => csvEscape(r[c])).join(","))].join("\n");
+    return reply
+      .status(200)
+      .header("content-type", "text/csv")
+      .header("content-disposition", `attachment; filename="operations-${q.kind}.csv"`)
+      .send(csv);
+  });
+}
+
+// --- helpers (file-local) -------------------------------------------------
+
+/** Redact known-sensitive keys from a JSON payload before surfacing. */
+function redactPayload(payload: unknown): unknown {
+  if (payload == null || typeof payload !== "object") return payload;
+  try {
+    const obj = payload as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (/password|secret|token|authorization|api[_-]?key/i.test(k)) {
+        out[k] = "[REDACTED]";
+      } else if (typeof v === "object" && v !== null) {
+        out[k] = redactPayload(v);
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  } catch {
+    return "[unredactable]";
+  }
 }

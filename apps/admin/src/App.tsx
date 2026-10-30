@@ -25,6 +25,7 @@ import { Analytics } from "./pages/Analytics";
 import { ProvidersSettlement } from "./pages/ProvidersSettlement";
 import { Security } from "./pages/Security";
 import { Settings } from "./pages/Settings";
+import { Operations } from "./pages/Operations";
 import { AccessDenied } from "./pages/AccessDenied";
 import { NotFound } from "./pages/NotFound";
 import "./index.css";
@@ -78,6 +79,7 @@ function Shell() {
         <Route path="/providers" element={<RequirePerm perm="providers.read"><ProvidersSettlement /></RequirePerm>} />
         <Route path="/security" element={<RequirePerm perm="security.read"><Security /></RequirePerm>} />
         <Route path="/settings" element={<RequirePerm perm="settings.read"><Settings /></RequirePerm>} />
+        <Route path="/operations" element={<RequirePerm perm="ops.view"><Operations /></RequirePerm>} />
 
         {/* Unknown admin URLs: a clean not-found state instead of silent redirect. */}
         <Route path="*" element={<NotFound key={location.pathname} />} />

@@ -18,6 +18,8 @@ export const forbidden = (m = "forbidden") => new AppError("forbidden", m, 403);
 export const notFound = (m = "not found") => new AppError("not_found", m, 404);
 export const conflict = (m: string) => new AppError("conflict", m, 409);
 export const tooMany = (m = "too many requests") => new AppError("rate_limited", m, 429);
+/** Not implemented / capability not wired up (e.g. BACKUP_SCRIPT_PATH unset). */
+export const notConfigured = (m: string, d?: unknown) => new AppError("not_configured", m, 501, d);
 
 export function setErrorHandler(reply: FastifyReply, err: unknown): FastifyReply {
   if (err instanceof AppError) {

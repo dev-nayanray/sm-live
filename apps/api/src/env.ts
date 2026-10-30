@@ -28,6 +28,29 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().default("http://localhost:5173,http://localhost:4173"),
   PUBLIC_API_BASE: z.string().default("http://localhost:4000"),
   PAYMENT_ADAPTER: z.enum(["fake"]).default("fake"),
+  // --- Platform Operations (Prompt 12) ---------------------------------------
+  // Backup discovery — when set, the API scans this directory for verified
+  // backup files (sm_live_*.sql.gz). Empty by default → endpoint returns
+  // `not_configured` rather than guessing a path.
+  BACKUP_DIR_PATH: z.string().default(""),
+  // Backup creation — when set to an executable script path (e.g.
+  // `./infra/backup.sh`), the API invokes it on POST /v1/admin/operations/
+  // backups/run. Empty by default → backup creation is disabled from the
+  // admin UI; backups must be created out-of-band (cron / CI).
+  BACKUP_SCRIPT_PATH: z.string().default(""),
+  // Restore execution — when set to an executable script path (e.g.
+  // `./infra/restore.sh`), the API invokes it for staging/sandbox restores.
+  // Empty by default → restore workflow is "document-only" from the admin
+  // UI; production restores are always manual (see infra/restore.sh).
+  RESTORE_SCRIPT_PATH: z.string().default(""),
+  // Maintenance banner scope enforcement. When `MAINTENANCE_STRICT` is
+  // `true`, the user-facing routes return 503 during an active `platform`
+  // maintenance window. Default false in dev so the seed/fixture data
+  // remains reachable; production should set this to `true`.
+  MAINTENANCE_STRICT: z.enum(["true", "false"]).default("false"),
+  // Health check retention (days). Health-check results older than this
+  // are pruned by the scheduler to keep the table bounded.
+  HEALTH_CHECK_RETENTION_DAYS: z.coerce.number().int().min(1).max(90).default(7),
 });
 
 export const env = envSchema.parse(process.env);

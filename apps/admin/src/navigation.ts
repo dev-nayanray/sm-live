@@ -404,6 +404,63 @@ export const NAV_GROUPS: NavGroup[] = [
       },
     ],
   },
+  {
+    id: "operations",
+    label: "Platform Operations",
+    icon: "server",
+    perm: "ops.view",
+    items: [
+      {
+        to: "/operations",
+        label: "Operations Dashboard",
+        perm: "ops.view",
+        icon: "pulse",
+        hint: "Real-time platform health, infrastructure status, maintenance, backups, incidents, alerts, jobs & reports.",
+      },
+      {
+        to: "/operations",
+        label: "Health Checks",
+        perm: "ops.view",
+        icon: "pulse",
+        hint: "Component health probes — backend, DB, Redis, providers, wallet, webhooks.",
+      },
+      {
+        to: "/operations",
+        label: "Maintenance",
+        perm: "ops.maintenance",
+        icon: "wrench",
+        hint: "Schedule / activate / cancel maintenance windows for the platform or a single module.",
+      },
+      {
+        to: "/operations",
+        label: "Backups & Recovery",
+        perm: "ops.backups",
+        icon: "toolbox",
+        hint: "Verified backup history, manual backup triggers, restore workflow with audit trail.",
+      },
+      {
+        to: "/operations",
+        label: "Incidents & Alerts",
+        perm: "ops.incidents",
+        icon: "alert",
+        hint: "Operational incidents and system alerts with ack / resolve state machine.",
+      },
+      {
+        to: "/operations",
+        label: "System Logs",
+        perm: "ops.logs",
+        icon: "scroll",
+        hint: "Redacted API error logs and full admin audit trail.",
+      },
+      {
+        to: "/operations",
+        label: "Background Jobs",
+        perm: "ops.jobs",
+        icon: "refresh",
+        hint: "Live BullMQ queue + scheduled repeat jobs (recover-rounds, daily-rollup, …).",
+      },
+    ],
+  },
 ];
 
 /**

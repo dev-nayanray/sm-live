@@ -19,15 +19,24 @@ export const PERMISSIONS = [
   "providers.read", "providers.write",
   "security.read", "security.write",
   "settings.read", "settings.write",
+  // Platform operations (Prompt 12)
+  "ops.view",          // view operations dashboard, health checks, infrastructure status
+  "ops.maintenance",   // manage maintenance mode + schedule maintenance
+  "ops.backups",       // view backup history
+  "ops.backups.write", // create / delete backups
+  "ops.restore",       // initiate restore operations (elevated)
+  "ops.incidents",     // manage operational incidents + alerts
+  "ops.logs",          // view system logs (redacted)
+  "ops.jobs",          // manage background jobs / scheduled tasks
 ] as const;
 export type Permission = (typeof PERMISSIONS)[number];
 
 export const ROLE_DEFAULT_PERMISSIONS: Record<AdminRole, readonly Permission[]> = {
   super_admin: PERMISSIONS,
-  security_admin: ["dashboard.view", "security.read", "security.write", "players.read", "players.write"],
-  finance: ["dashboard.view", "wallet.read", "wallet.write", "reports.read", "providers.read", "providers.write"],
-  support: ["dashboard.view", "players.read", "rooms.read", "users.read"],
-  agency_admin: ["dashboard.view", "users.read", "agencies.read", "wallet.read"],
+  security_admin: ["dashboard.view", "security.read", "security.write", "players.read", "players.write", "ops.view", "ops.logs", "ops.incidents"],
+  finance: ["dashboard.view", "wallet.read", "wallet.write", "reports.read", "providers.read", "providers.write", "ops.view"],
+  support: ["dashboard.view", "players.read", "rooms.read", "users.read", "ops.view"],
+  agency_admin: ["dashboard.view", "users.read", "agencies.read", "wallet.read", "ops.view"],
 };
 
 // ---------------------------------------------------------------------------
@@ -463,6 +472,213 @@ export type ApiResponse<T> = ApiOk<T> | ApiError;
 
 export const LEDGER_KINDS = ["recharge", "bet_debit", "bet_refund", "win_credit", "gift_debit", "gift_credit", "agency_commission", "admin_adjust", "refund"] as const;
 export type LedgerKind = (typeof LEDGER_KINDS)[number];
+
+// ===========================================================================
+// Platform Operations, Monitoring, Maintenance & Backup (Prompt 12)
+// ===========================================================================
+//
+// All enumerations are surfaced here so the admin UI, backend validation and
+// tests share one source of truth. The Zod schemas mirror the Prisma models
+// added in migration 20261030160000_operations — they are intentionally strict
+// (no free-text status / severity) so the API can never persist an unknown
+// value.
+
+/** Maintenance scope — a single module or the whole platform. */
+export const MAINTENANCE_SCOPES = ["platform", "live", "games", "wallet", "integration"] as const;
+export type MaintenanceScope = (typeof MAINTENANCE_SCOPES)[number];
+
+/** Maintenance schedule lifecycle. */
+export const MAINTENANCE_STATUSES = ["scheduled", "active", "completed", "cancelled"] as const;
+export type MaintenanceStatus = (typeof MAINTENANCE_STATUSES)[number];
+
+/** Maintenance event log — append-only audit trail per schedule. */
+export const MAINTENANCE_EVENT_TYPES = ["created", "started", "ended", "cancelled", "extended", "rescheduled", "updated"] as const;
+export type MaintenanceEventType = (typeof MAINTENANCE_EVENT_TYPES)[number];
+
+/** Backup kind — distinguishes full DB dumps from config-only snapshots. */
+export const BACKUP_KINDS = ["database", "config", "media", "application"] as const;
+export type BackupKind = (typeof BACKUP_KINDS)[number];
+
+/** Backup lifecycle. `verified` requires explicit admin verification. */
+export const BACKUP_STATUSES = ["pending", "running", "succeeded", "failed", "verified", "expired", "deleted"] as const;
+export type BackupStatus = (typeof BACKUP_STATUSES)[number];
+
+/** Recovery lifecycle. */
+export const RECOVERY_STATUSES = ["pending", "running", "succeeded", "failed", "cancelled"] as const;
+export type RecoveryStatus = (typeof RECOVERY_STATUSES)[number];
+
+/** Health check status — `not_configured` is reserved for unavailable checks. */
+export const HEALTH_STATUSES = ["healthy", "degraded", "down", "unknown", "not_configured"] as const;
+export type HealthStatus = (typeof HEALTH_STATUSES)[number];
+
+/** Incident lifecycle — terminal state is `closed`. */
+export const INCIDENT_STATUSES = ["open", "investigating", "identified", "monitoring", "resolved", "closed"] as const;
+export type IncidentStatus = (typeof INCIDENT_STATUSES)[number];
+
+export const INCIDENT_SEVERITIES = ["low", "medium", "high", "critical"] as const;
+export type IncidentSeverity = (typeof INCIDENT_SEVERITIES)[number];
+
+/** Operational alert lifecycle. */
+export const ALERT_STATUSES = ["open", "acknowledged", "resolved"] as const;
+export type AlertStatus = (typeof ALERT_STATUSES)[number];
+
+export const ALERT_SEVERITIES = ["info", "warning", "high", "critical"] as const;
+export type AlertSeverity = (typeof ALERT_SEVERITIES)[number];
+
+/** System log level — kept in sync with pino (no `trace` since logs are not exported). */
+export const LOG_LEVELS = ["debug", "info", "warn", "error", "critical"] as const;
+export type LogLevel = (typeof LOG_LEVELS)[number];
+
+/** System log services — every entry must belong to a known service. */
+export const LOG_SERVICES = ["api", "database", "redis", "scheduler", "provider", "webhook", "wallet", "maintenance", "backup", "recovery", "auth", "room", "game", "system"] as const;
+export type LogService = (typeof LOG_SERVICES)[number];
+
+/** Scheduled job lifecycle as observed from the queue. */
+export const JOB_STATUSES = ["waiting", "active", "completed", "failed", "delayed", "paused"] as const;
+export type JobStatus = (typeof JOB_STATUSES)[number];
+
+// --- Maintenance schemas -----------------------------------------------------
+
+export const maintenanceCreateSchema = z.object({
+  scope: z.enum(MAINTENANCE_SCOPES),
+  title: z.string().trim().min(3).max(120),
+  message: z.string().trim().max(1000).default(""),
+  startAt: z.coerce.date(),
+  endAt: z.coerce.date(),
+  internalNotes: z.string().trim().max(2000).default(""),
+  reason: z.string().trim().min(1).max(300),
+});
+export type MaintenanceCreateInput = z.infer<typeof maintenanceCreateSchema>;
+
+export const maintenanceUpdateSchema = z.object({
+  title: z.string().trim().min(3).max(120).optional(),
+  message: z.string().trim().max(1000).optional(),
+  startAt: z.coerce.date().optional(),
+  endAt: z.coerce.date().optional(),
+  internalNotes: z.string().trim().max(2000).optional(),
+});
+export type MaintenanceUpdateInput = z.infer<typeof maintenanceUpdateSchema>;
+
+/** Activate / deactivate a maintenance window immediately. Requires a reason. */
+export const maintenanceActionSchema = z.object({
+  action: z.enum(["activate", "deactivate", "cancel"]),
+  reason: z.string().trim().min(1).max(300),
+});
+
+export const maintenanceListQuerySchema = paginationQuery.extend({
+  scope: z.enum(MAINTENANCE_SCOPES).optional(),
+  status: z.enum(MAINTENANCE_STATUSES).optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+// --- Backup schemas ----------------------------------------------------------
+
+/** Backup creation — the API only kicks off an existing backup script.
+ *  If no `BACKUP_SCRIPT_PATH` is configured the request is rejected with
+ *  `not_configured`. We never persist a "succeeded" record unless the
+ *  underlying script returned a verifiable file. */
+export const backupCreateSchema = z.object({
+  kind: z.enum(BACKUP_KINDS).default("database"),
+  note: z.string().trim().max(300).default(""),
+});
+
+/** Backup deletion — only `expired` or `failed` backups may be deleted.
+ *  The last verified backup of each kind is protected from deletion. */
+export const backupDeleteSchema = z.object({
+  reason: z.string().trim().min(1).max(300),
+});
+
+/** Backup verification — promotes a `succeeded` backup to `verified`. */
+export const backupVerifySchema = z.object({
+  note: z.string().trim().max(300).default(""),
+});
+
+export const backupListQuerySchema = paginationQuery.extend({
+  kind: z.enum(BACKUP_KINDS).optional(),
+  status: z.enum(BACKUP_STATUSES).optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+// --- Recovery schemas --------------------------------------------------------
+
+/** Restore workflow — initiates a recovery workflow.
+ *  Backed by a recovery script if `RESTORE_SCRIPT_PATH` is configured;
+ *  otherwise returns `not_configured`. Restore can NEVER be triggered
+ *  against the live production target from the admin UI; the API
+ *  explicitly refuses `targetEnvironment === "production"`. */
+export const recoveryCreateSchema = z.object({
+  backupId: z.coerce.number().int().positive(),
+  targetEnvironment: z.enum(["staging", "sandbox"]).default("staging"),
+  notes: z.string().trim().max(1000).default(""),
+  confirm: z.literal(true),
+});
+
+// --- Incident schemas --------------------------------------------------------
+
+export const incidentCreateSchema = z.object({
+  title: z.string().trim().min(3).max(160),
+  description: z.string().trim().min(1).max(4000),
+  severity: z.enum(INCIDENT_SEVERITIES).default("medium"),
+  affectedService: z.string().trim().max(80).default(""),
+  assigneeId: z.coerce.number().int().positive().nullable().optional(),
+});
+
+export const incidentUpdateSchema = z.object({
+  title: z.string().trim().min(3).max(160).optional(),
+  description: z.string().trim().max(4000).optional(),
+  severity: z.enum(INCIDENT_SEVERITIES).optional(),
+  status: z.enum(INCIDENT_STATUSES).optional(),
+  affectedService: z.string().trim().max(80).optional(),
+  assigneeId: z.coerce.number().int().positive().nullable().optional(),
+  internalNotes: z.string().trim().max(4000).optional(),
+  resolutionDetails: z.string().trim().max(4000).optional(),
+});
+
+export const incidentListQuerySchema = paginationQuery.extend({
+  status: z.enum(INCIDENT_STATUSES).optional(),
+  severity: z.enum(INCIDENT_SEVERITIES).optional(),
+  assigneeId: z.coerce.number().int().positive().optional(),
+});
+
+// --- Alert schemas -----------------------------------------------------------
+
+export const alertListQuerySchema = paginationQuery.extend({
+  status: z.enum(ALERT_STATUSES).optional(),
+  severity: z.enum(ALERT_SEVERITIES).optional(),
+  source: z.string().trim().max(60).optional(),
+});
+
+export const alertAckSchema = z.object({
+  note: z.string().trim().max(500).default(""),
+});
+
+export const alertResolveSchema = z.object({
+  resolutionNotes: z.string().trim().min(1).max(1000),
+});
+
+// --- System log schemas ------------------------------------------------------
+
+export const logListQuerySchema = paginationQuery.extend({
+  level: z.enum(LOG_LEVELS).optional(),
+  service: z.enum(LOG_SERVICES).optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+// --- Job schemas -------------------------------------------------------------
+
+export const jobListQuerySchema = paginationQuery.extend({
+  status: z.enum(JOB_STATUSES).optional(),
+});
+
+/** Job retry — financial / wallet / payout jobs cannot be retried blindly.
+ *  The API refuses retries whose payload name is on a deny-list; the
+ *  deny-list is enforced server-side so the frontend cannot bypass it. */
+export const jobRetrySchema = z.object({
+  reason: z.string().trim().min(1).max(300),
+});
 
 export const CONSTANT = {
   COIN_CURRENCY: "coins",

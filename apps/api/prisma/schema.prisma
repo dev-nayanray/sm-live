@@ -91,13 +91,24 @@ model AdminUser {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
-  role       Role       @relation(fields: [roleId], references: [id])
-  agency     Agency?    @relation(fields: [agencyId], references: [id])
-  auditLogs  AuditLog[]
-  refunds    Refund[]
-  adminNotes AdminNote[]
-  assignedTickets  SupportTicket[] @relation("TicketAssignee")
-  ticketMessages   TicketMessage[]
+  role                 Role                  @relation(fields: [roleId], references: [id])
+  agency               Agency?               @relation(fields: [agencyId], references: [id])
+  auditLogs            AuditLog[]
+  refunds              Refund[]
+  adminNotes           AdminNote[]
+  assignedTickets      SupportTicket[]       @relation("TicketAssignee")
+  ticketMessages       TicketMessage[]
+  // Operations module back-relations (Prompt 12). Named relations so
+  // the existing implicit relations are unaffected.
+  maintenanceCreated   MaintenanceSchedule[] @relation("MaintenanceCreator")
+  maintenanceScheduled MaintenanceSchedule[] @relation("MaintenanceScheduler")
+  maintenanceEvents    MaintenanceEvent[]    @relation("MaintenanceEventActor")
+  backupsCreated       BackupRecord[]        @relation("BackupCreator")
+  recoveriesRequested  RecoveryRecord[]      @relation("RecoveryRequester")
+  incidentsAssigned    OperationalIncident[] @relation("IncidentAssignee")
+  incidentsCreated     OperationalIncident[] @relation("IncidentCreator")
+  alertsAcked          SystemAlert[]         @relation("AlertAckedBy")
+  alertsResolved       SystemAlert[]         @relation("AlertResolvedBy")
 
   @@index([roleId])
 }
@@ -574,11 +585,9 @@ model AuditLog {
 
 /**
  * Internal administrative notes attached to a user.
- *
  * Created by Super Admins to record moderation context, review history, and
  * shift hand-off notes. NEVER exposed to the mobile app — these are internal
  * records used to coordinate admin actions.
- *
  * `internal` defaults to true; even when set to false, the field is still
  * surfaced only inside the admin panel (no public endpoint reads it). The
  * flag exists so future customer-facing note features can opt-in per note.
@@ -615,24 +624,23 @@ model SecurityEvent {
  * optionally to a reported user within that room). This is separate from the
  * existing user-level `Complaint` model — room reports carry roomId +
  * optional reportedUserId context that the user-level complaint lacks.
- *
  * Status flow: open → in_review → resolved | dismissed.
  * Reporter identity is stored but NOT exposed to the reported user or to
  * admins who lack `rooms.read` permission.
  */
 model RoomReport {
-  id              Int      @id @default(autoincrement())
-  roomId          Int
-  reporterId      Int?
-  reportedUserId  Int?
-  category        String   @default("other") // harassment | inappropriate_content | spam | impersonation | suspicious | other
-  description     String   @default("")
-  status          String   @default("open") // open | in_review | resolved | dismissed
-  reviewerId      Int?
-  reviewNote      String   @default("")
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  room            Room     @relation(fields: [roomId], references: [id])
+  id             Int      @id @default(autoincrement())
+  roomId         Int
+  reporterId     Int?
+  reportedUserId Int?
+  category       String   @default("other") // harassment | inappropriate_content | spam | impersonation | suspicious | other
+  description    String   @default("")
+  status         String   @default("open") // open | in_review | resolved | dismissed
+  reviewerId     Int?
+  reviewNote     String   @default("")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  room           Room     @relation(fields: [roomId], references: [id])
 
   @@index([roomId])
   @@index([status])
@@ -649,7 +657,7 @@ model RoomReport {
 model RoomEvent {
   id        Int      @id @default(autoincrement())
   roomId    Int
-  type      String   // created | closed | participant_joined | participant_left | participant_kicked | participant_muted | participant_unmuted | report_filed | report_resolved | admin_action
+  type      String // created | closed | participant_joined | participant_left | participant_kicked | participant_muted | participant_unmuted | report_filed | report_resolved | admin_action
   userId    Int?
   adminId   Int?
   details   Json?
@@ -798,20 +806,20 @@ model DailyRevenue {
  * Tracks subject, category, priority, status, and assignment.
  */
 model SupportTicket {
-  id          Int       @id @default(autoincrement())
+  id          Int      @id @default(autoincrement())
   userId      Int
   subject     String
-  description String    @default("")
-  category    String    @default("other")
-  priority    String    @default("normal") // low | normal | high | urgent
-  status      String    @default("new") // new | open | in_progress | waiting_user | waiting_internal | escalated | resolved | closed
+  description String   @default("")
+  category    String   @default("other")
+  priority    String   @default("normal") // low | normal | high | urgent
+  status      String   @default("new") // new | open | in_progress | waiting_user | waiting_internal | escalated | resolved | closed
   assigneeId  Int?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
-  user       User       @relation(fields: [userId], references: [id])
-  assignee   AdminUser? @relation("TicketAssignee", fields: [assigneeId], references: [id])
-  messages   TicketMessage[]
+  user     User            @relation(fields: [userId], references: [id])
+  assignee AdminUser?      @relation("TicketAssignee", fields: [assigneeId], references: [id])
+  messages TicketMessage[]
 
   @@index([userId])
   @@index([status])
@@ -827,14 +835,247 @@ model SupportTicket {
 model TicketMessage {
   id         Int      @id @default(autoincrement())
   ticketId   Int
-  authorId   Int?     // null = user; non-null = admin
+  authorId   Int? // null = user; non-null = admin
   authorType String   @default("user") // user | admin
   body       String
   isInternal Boolean  @default(false) // internal notes never exposed to users
   createdAt  DateTime @default(now())
 
-  ticket     SupportTicket @relation(fields: [ticketId], references: [id])
-  author     AdminUser?    @relation(fields: [authorId], references: [id])
+  ticket SupportTicket @relation(fields: [ticketId], references: [id])
+  author AdminUser?    @relation(fields: [authorId], references: [id])
 
   @@index([ticketId, createdAt])
+}
+
+// ===========================================================================
+// Platform Operations, Monitoring, Maintenance & Backup (Prompt 12)
+// ===========================================================================
+//
+// The following models back the Operations module. They are appenditive —
+// no existing column or relation is changed. All statuses / severities are
+// free-text columns constrained by Zod at the API boundary (see
+// packages/shared/src/index.ts → MAINTENANCE_STATUSES etc.) so the schema
+// stays flexible while the API refuses to persist unknown values.
+
+/**
+ * Maintenance schedule — a planned maintenance window for a single module
+ * (or the whole platform). `status` transitions are:
+ * scheduled → active → completed
+ * │
+ * └→ cancelled
+ * `createdById` / `scheduledById` are AdminUser FKs. The maintenance notice
+ * shown to end users is rendered from `title` + `message` + `startAt` +
+ * `endAt`. The `internalNotes` field is admin-only.
+ * `scope` is one of MAINTENANCE_SCOPES: `platform | live | games | wallet |
+ * integration`. The admin panel can only schedule maintenance for scopes
+ * the backend can enforce — today this is the platform-wide banner; full
+ * per-module enforcement requires middleware on the user-facing routes
+ * (documented in docs/RUNBOOK.md).
+ */
+model MaintenanceSchedule {
+  id            Int       @id @default(autoincrement())
+  scope         String    @default("platform") // platform | live | games | wallet | integration
+  title         String
+  message       String    @default("")
+  status        String    @default("scheduled") // scheduled | active | completed | cancelled
+  startAt       DateTime
+  endAt         DateTime
+  internalNotes String    @default("")
+  createdById   Int
+  scheduledById Int?
+  activatedAt   DateTime?
+  completedAt   DateTime?
+  cancelledAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  createdBy   AdminUser          @relation("MaintenanceCreator", fields: [createdById], references: [id])
+  scheduledBy AdminUser?         @relation("MaintenanceScheduler", fields: [scheduledById], references: [id])
+  events      MaintenanceEvent[]
+
+  @@index([scope, status])
+  @@index([status, startAt])
+  @@index([createdById])
+}
+
+/**
+ * Maintenance event log — append-only audit trail per schedule. Each row
+ * records an admin-initiated transition (`created`, `started`, `ended`,
+ * `cancelled`, `extended`, `rescheduled`, `updated`) plus a free-text
+ * reason. Records are never updated or deleted.
+ */
+model MaintenanceEvent {
+  id            Int      @id @default(autoincrement())
+  maintenanceId Int
+  type          String // created | started | ended | cancelled | extended | rescheduled | updated
+  note          String   @default("")
+  adminId       Int?
+  createdAt     DateTime @default(now())
+
+  maintenance MaintenanceSchedule @relation(fields: [maintenanceId], references: [id], onDelete: Cascade)
+  admin       AdminUser?          @relation("MaintenanceEventActor", fields: [adminId], references: [id])
+
+  @@index([maintenanceId, createdAt])
+  @@index([type])
+}
+
+/**
+ * Backup record — one row per backup attempt. `status` transitions:
+ * pending → running → succeeded → verified
+ * └→ failed
+ * ↓ (after retention)
+ * expired / deleted
+ * The `location` field stores a masked path or container URI (no
+ * credentials). `checksum` is the SHA-256 of the backup file computed
+ * after creation (used to detect tampering / verify integrity). `sizeBytes`
+ * is the file size as reported by the filesystem after the script
+ * completes. Records are only created when the underlying backup script
+ * is invoked through the API; if `BACKUP_SCRIPT_PATH` is not configured,
+ * the create endpoint returns `not_configured` and no row is persisted.
+ * `meta` is a JSON column reserved for provider-specific metadata (e.g.
+ * Postgres version, encryption flag) — never secrets.
+ */
+model BackupRecord {
+  id          Int       @id @default(autoincrement())
+  kind        String    @default("database") // database | config | media | application
+  scope       String    @default("platform")
+  status      String    @default("pending") // pending | running | succeeded | failed | verified | expired | deleted
+  location    String    @default("") // masked path — no credentials
+  sizeBytes   Int?
+  checksum    String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdById Int?
+  note        String    @default("")
+  error       String    @default("")
+  meta        Json?
+  createdAt   DateTime  @default(now())
+
+  createdBy  AdminUser?       @relation("BackupCreator", fields: [createdById], references: [id])
+  recoveries RecoveryRecord[]
+
+  @@index([kind, status])
+  @@index([status, createdAt])
+  @@index([createdById])
+}
+
+/**
+ * Recovery record — one row per restore attempt. `targetEnvironment` is
+ * constrained to `staging` or `sandbox`; the API refuses `production`
+ * restores from the admin UI. Restores against production must be
+ * performed manually on the server (see infra/restore.sh).
+ * `impact` documents the destructive scope of the restore (which tables
+ * get overwritten). `result` records the outcome — `succeeded` only
+ * when the recovery script exited 0 AND the post-restore integrity check
+ * passed.
+ */
+model RecoveryRecord {
+  id                Int       @id @default(autoincrement())
+  backupId          Int
+  status            String    @default("pending") // pending | running | succeeded | failed | cancelled
+  targetEnvironment String    @default("staging") // staging | sandbox — never production
+  impact            String    @default("")
+  notes             String    @default("")
+  result            String    @default("")
+  requestedById     Int?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime  @default(now())
+
+  backup      BackupRecord @relation(fields: [backupId], references: [id])
+  requestedBy AdminUser?   @relation("RecoveryRequester", fields: [requestedById], references: [id])
+
+  @@index([backupId])
+  @@index([status, createdAt])
+  @@index([requestedById])
+}
+
+/**
+ * Health check result — one row per (component × timestamp) check run.
+ * `status` is one of HEALTH_STATUSES: `healthy | degraded | down |
+ * unknown | not_configured`. Records are kept for the configured retention
+ * (default 7 days) so the dashboard can plot a trend without scanning
+ * application logs. `responseTimeMs` is null when the check is
+ * `not_configured` or `down` (no successful response to measure).
+ * `meta` stores structured details (e.g. queue depth, error count) — never
+ * secrets. `details` is a short human-readable message shown to admins.
+ */
+model HealthCheckResult {
+  id             Int      @id @default(autoincrement())
+  component      String // frontend | backend | database | auth | api | file_storage | workers | queue | notifications | providers | wallet | webhooks
+  status         String   @default("unknown") // healthy | degraded | down | unknown | not_configured
+  responseTimeMs Int?
+  details        String   @default("")
+  error          String   @default("")
+  meta           Json?
+  checkedAt      DateTime @default(now())
+
+  @@index([component, checkedAt])
+  @@index([status, checkedAt])
+}
+
+/**
+ * Operational incident — a tracked event affecting platform availability
+ * or correctness. `status` transitions: `open → investigating →
+ * identified → monitoring → resolved → closed`. `severity` is one of
+ * INCIDENT_SEVERITIES. `affectedService` is a free-text label (e.g.
+ * "postgres", "livekit", "mockcorp-provider"). Internal notes / resolution
+ * details are admin-only.
+ */
+model OperationalIncident {
+  id                Int       @id @default(autoincrement())
+  title             String
+  description       String    @default("")
+  severity          String    @default("medium") // low | medium | high | critical
+  status            String    @default("open") // open | investigating | identified | monitoring | resolved | closed
+  affectedService   String    @default("")
+  assigneeId        Int?
+  internalNotes     String    @default("")
+  resolutionDetails String    @default("")
+  createdById       Int?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  closedAt          DateTime?
+
+  assignee  AdminUser? @relation("IncidentAssignee", fields: [assigneeId], references: [id])
+  createdBy AdminUser? @relation("IncidentCreator", fields: [createdById], references: [id])
+
+  @@index([status, severity])
+  @@index([assigneeId])
+  @@index([affectedService])
+  @@index([createdAt])
+}
+
+/**
+ * Operational alert — raised by the system (or by an admin) when an
+ * operational signal crosses a threshold. Alerts are deduplicated by
+ * `source + fingerprint` so the same root cause does not flood the
+ * dashboard. `status` transitions: `open → acknowledged → resolved`.
+ * `fingerprint` is a stable hash of (source + message + severity) so
+ * repeated occurrences are collapsed into a count rather than new rows.
+ * `meta` carries the structured context (metric value, threshold, time).
+ */
+model SystemAlert {
+  id              Int       @id @default(autoincrement())
+  source          String // database | api | redis | scheduler | provider | webhook | wallet | maintenance | backup
+  severity        String    @default("warning") // info | warning | high | critical
+  status          String    @default("open") // open | acknowledged | resolved
+  message         String
+  fingerprint     String    @default("")
+  meta            Json?
+  ackedById       Int?
+  resolvedById    Int?
+  acknowledgedAt  DateTime?
+  resolvedAt      DateTime?
+  resolutionNotes String    @default("")
+  occurrenceCount Int       @default(1)
+  lastOccurredAt  DateTime  @default(now())
+  createdAt       DateTime  @default(now())
+
+  ackedBy    AdminUser? @relation("AlertAckedBy", fields: [ackedById], references: [id])
+  resolvedBy AdminUser? @relation("AlertResolvedBy", fields: [resolvedById], references: [id])
+
+  @@index([status, severity])
+  @@index([source, fingerprint])
+  @@index([createdAt])
 }
