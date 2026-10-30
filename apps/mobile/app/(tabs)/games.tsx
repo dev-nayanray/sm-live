@@ -1,72 +1,122 @@
 import { router } from "expo-router";
-import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
-import { useCallback, useState } from "react";
-import { useAppConfig } from "../../src/state/AppProviders";
+import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { useCallback, useEffect, useState } from "react";
+import { api } from "../../src/api/client";
+import { useAuth } from "../../src/state/AppProviders";
+import {
+  Badge, Button, EmptyState, ErrorState, Loading, TopHeader,
+  theme, t, spacing, radius,
+} from "../../src/components";
+import { gameIcon, formatCoins } from "../../src/hooks/gamePure";
 
-/** Games list straight from GET /v1/config/app — no hard-coded entries. */
-export default function Games() {
-  const { config, flag } = useAppConfig();
-  const [error] = useState<string | null>(null);
+interface GameItem {
+  code: string; name: string; isPro: boolean;
+  thumbnailUrl: string; version: string;
+  minBet: number | null; maxBet: number | null;
+}
 
-  const enabled = flag("games.enabled");
-  const games = config.games;
+export default function GamesTab() {
+  const { loggedIn } = useAuth();
+  const [games, setGames] = useState<GameItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
 
-  const open = useCallback((code: string) => {
-    router.push(`/game/${code}`);
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const data = await api<GameItem[]>("/v1/games");
+      setGames(data);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
   }, []);
 
-  if (!enabled) {
-    return (
-      <View style={s.center}>
-        <Text style={s.big}>🎮</Text>
-        <Text style={s.title}>Games are switched off</Text>
-        <Text style={s.sub}>An admin can enable them in Settings → feature flags (games.enabled).</Text>
-      </View>
-    );
-  }
+  useEffect(() => { if (loggedIn) void load(); }, [loggedIn, load]);
 
-  if (error) {
+  const filtered = search.trim()
+    ? games.filter((g) =>
+        g.name.toLowerCase().includes(search.toLowerCase()) ||
+        g.code.toLowerCase().includes(search.toLowerCase()))
+    : games;
+
+  if (!loggedIn) {
     return (
-      <View style={s.center}>
-        <Text style={s.title}>couldn’t load games</Text>
-        <Text style={s.sub}>{error}</Text>
+      <View style={s.root}>
+        <TopHeader />
+        <EmptyState icon="🎮" title="Sign in to play" subtitle="Games are available to signed-in users." ctaLabel="Sign in" onCta={() => router.replace("/auth/welcome")} />
       </View>
     );
   }
 
   return (
-    <FlatList
-      style={s.root}
-      contentContainerStyle={{ padding: 16 }}
-      data={games}
-      keyExtractor={(g) => g.code}
-      numColumns={2}
-      columnWrapperStyle={{ gap: 10, marginBottom: 10 }}
-      ListEmptyComponent={<Text style={s.sub}>no games configured for this market</Text>}
-      renderItem={({ item }) => (
-        <Pressable style={s.card} onPress={() => open(item.code)}>
-          <View style={s.thumb}><Text style={s.thumbIcon}>{item.isPro ? "💎" : "🎲"}</Text></View>
-          <Text style={s.name}>{item.name}</Text>
-          <Text style={s.meta}>bet {item.minBet}–{item.maxBet} 🪙</Text>
-          {item.isPro && <Text style={s.pro}>PRO</Text>}
-          {item.status === "maintenance" && <Text style={s.maint}>maintenance</Text>}
-        </Pressable>
+    <View style={s.root}>
+      <TopHeader />
+      <View style={s.header}>
+        <Text style={s.title}>Games</Text>
+        <Button variant="ghost" label="History" onPress={() => router.push("/game/history")} style={{ height: 36, paddingHorizontal: spacing[3] }} />
+      </View>
+      <View style={s.searchRow}>
+        <TextInput
+          style={s.searchInput}
+          value={search}
+          onChangeText={setSearch}
+          placeholder="Search games…"
+          placeholderTextColor={theme.textSubtle}
+        />
+      </View>
+      {loading ? <Loading label="Loading games…" /> : error ? (
+        <ErrorState title="Couldn't load games" subtitle={error} ctaLabel="Retry" onCta={() => { setLoading(true); void load(); }} />
+      ) : filtered.length === 0 ? (
+        <EmptyState icon="🎮" title={search ? "No games match" : "No games available"} subtitle={search ? "Try a different search." : "Check back later or contact an admin."} />
+      ) : (
+        <FlatList
+          data={filtered}
+          keyExtractor={(g) => g.code}
+          numColumns={2}
+          contentContainerStyle={{ padding: spacing[3], gap: spacing[2] }}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); void load(); }} tintColor={theme.primary} />}
+          columnWrapperStyle={{ gap: spacing[2], marginBottom: spacing[2] }}
+          renderItem={({ item: g }) => (
+            <Pressable
+              style={s.card}
+              onPress={() => router.push(`/game/${g.code}/details`)}
+            >
+              <View style={s.thumb}>
+                <Text style={s.thumbIcon}>{gameIcon(g.isPro)}</Text>
+              </View>
+              <Text style={s.gameName} numberOfLines={1}>{g.name}</Text>
+              {g.minBet != null && g.maxBet != null && (
+                <Text style={s.gameBet}>🪙 {formatCoins(g.minBet)}–{formatCoins(g.maxBet)}</Text>
+              )}
+              <View style={s.badgeRow}>
+                {g.isPro && <Badge tone="vip" label="PRO" />}
+                <Badge tone="muted" label={g.version} />
+              </View>
+            </Pressable>
+          )}
+        />
       )}
-    />
+    </View>
   );
 }
 
+import { TextInput } from "react-native";
+
 const s = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#0f172a" },
-  center: { flex: 1, backgroundColor: "#0f172a", alignItems: "center", justifyContent: "center", padding: 32 },
-  big: { fontSize: 48, marginBottom: 12 },
-  title: { color: "#f8fafc", fontWeight: "700", fontSize: 16, marginBottom: 8 },
-  sub: { color: "#64748b", textAlign: "center" },
-  card: { flex: 1, backgroundColor: "#1e293b", borderRadius: 14, padding: 14 },
-  thumb: { height: 80, borderRadius: 10, backgroundColor: "#0f172a", alignItems: "center", justifyContent: "center", marginBottom: 10 },
-  thumbIcon: { fontSize: 34 },
-  name: { color: "#f8fafc", fontWeight: "700", marginBottom: 4 },
-  meta: { color: "#64748b", fontSize: 12 },
-  pro: { color: "#a78bfa", fontWeight: "800", fontSize: 11, marginTop: 6 },
-  maint: { color: "#f59e0b", fontSize: 11, marginTop: 6 },
+  root: { flex: 1, backgroundColor: theme.bg },
+  header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: spacing[4], paddingVertical: spacing[2] },
+  title: { ...t.h1, color: theme.text },
+  searchRow: { padding: spacing[3] },
+  searchInput: { height: 44, backgroundColor: theme.surface, color: theme.text, borderRadius: radius.md, borderWidth: 1, borderColor: theme.border, paddingHorizontal: spacing[3], ...t.body },
+  card: { flex: 1, backgroundColor: theme.surface, borderRadius: radius.lg, borderWidth: 1, borderColor: theme.border, padding: spacing[3], alignItems: "center", gap: spacing[1] },
+  thumb: { width: 70, height: 70, borderRadius: 35, backgroundColor: theme.surfaceAlt, alignItems: "center", justifyContent: "center" },
+  thumbIcon: { fontSize: 32 },
+  gameName: { ...t.body, color: theme.text, fontWeight: "700", textAlign: "center" },
+  gameBet: { ...t.micro, color: theme.success, fontWeight: "700" },
+  badgeRow: { flexDirection: "row", gap: spacing[1] },
 });
