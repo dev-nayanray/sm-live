@@ -39,8 +39,12 @@ function ThemedStack() {
         }}
       >
         <Stack.Screen name="index" options={{ headerShown: false }} />
+        <Stack.Screen name="auth/welcome" options={{ title: "Welcome", headerShown: false }} />
         <Stack.Screen name="auth/login" options={{ title: "Sign in", headerShown: false }} />
         <Stack.Screen name="auth/register" options={{ title: "Create account", headerShown: false }} />
+        <Stack.Screen name="auth/otp" options={{ title: "OTP sign-in", headerShown: false }} />
+        <Stack.Screen name="auth/forgot-password" options={{ title: "Forgot password", headerShown: false }} />
+        <Stack.Screen name="auth/reset-password" options={{ title: "Reset password", headerShown: false }} />
         <Stack.Screen name="room/[id]" options={{ title: "Room" }} />
         <Stack.Screen name="game/[code]" options={{ title: "Game" }} />
         <Stack.Screen name="wallet" options={{ title: "Wallet" }} />

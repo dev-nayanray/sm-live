@@ -43,6 +43,7 @@ model User {
   complaints     Complaint[]
   supportTickets SupportTicket[]
   refreshTokens  Session[]
+  passwordResets PasswordResetToken[]
   agencyMembers  AgencyMember[]
   adminNotes     AdminNote[]
 
@@ -76,6 +77,30 @@ model Session {
   user      User      @relation(fields: [userId], references: [id])
 
   @@index([userId])
+}
+
+/**
+ * Password-reset token (Prompt 14).
+ *
+ * One row per reset request. `tokenHash` is the SHA-256 of the raw token
+ * sent to the user (we never store the raw token). `consumedAt` marks
+ * the token as used — a token can be consumed exactly once. `expiresAt`
+ * is short-lived (15 minutes by default) so a leaked token is time-boxed.
+ *
+ * Cascade-deletes with the User so a deleted account cleans up its
+ * pending reset tokens.
+ */
+model PasswordResetToken {
+  id         Int       @id @default(autoincrement())
+  userId     Int
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 model AdminUser {

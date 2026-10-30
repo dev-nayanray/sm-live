@@ -51,6 +51,26 @@ export class ApiError extends Error {
 
 let refreshing: Promise<boolean> | null = null;
 
+/**
+ * Subscribers notified when refresh fails — AppProviders registers one so
+ * it can clear the local user + bounce the user back to the login
+ * screen. Keeps the API client free of any direct router import.
+ */
+type RefreshFailListener = () => void;
+const refreshFailListeners = new Set<RefreshFailListener>();
+
+/** Register a callback fired when a token refresh fails. Returns an unsubscribe fn. */
+export function onRefreshFailed(listener: RefreshFailListener): () => void {
+  refreshFailListeners.add(listener);
+  return () => refreshFailListeners.delete(listener);
+}
+
+function notifyRefreshFailed() {
+  for (const l of refreshFailListeners) {
+    try { l(); } catch { /* ignore listener errors */ }
+  }
+}
+
 /** Try to refresh the access token with the stored refresh token. */
 export async function tryRefresh(): Promise<boolean> {
   if (refreshing) return refreshing;
@@ -64,9 +84,19 @@ export async function tryRefresh(): Promise<boolean> {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ refreshToken }),
       });
-      if (!res.ok) return false;
+      if (!res.ok) {
+        // Refresh failed — clear the invalid tokens and notify subscribers
+        // so the UI can route the user back to login.
+        await tokenStore.clear();
+        notifyRefreshFailed();
+        return false;
+      }
       const json = (await res.json()) as { accessToken?: string; refreshToken?: string };
-      if (!json.accessToken || !json.refreshToken) return false;
+      if (!json.accessToken || !json.refreshToken) {
+        await tokenStore.clear();
+        notifyRefreshFailed();
+        return false;
+      }
       await tokenStore.set({ accessToken: json.accessToken, refreshToken: json.refreshToken });
       return true;
     } catch {

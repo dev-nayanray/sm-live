@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { providerRoutes } from "../src/routes/provider.js";
 import { adminResourceRoutes } from "../src/routes/admin/resources.js";
 import { adminRoutes } from "../src/routes/admin/index.js";
+import { authRoutes } from "../src/routes/v1/auth.js";
 import { walletRoutes } from "../src/routes/v1/wallet.js";
 import { setErrorHandler } from "../src/lib/errors.js";
 
@@ -19,6 +20,7 @@ export async function buildTestApp(): Promise<FastifyInstance> {
   await app.register(providerRoutes);
   await app.register(adminResourceRoutes);
   await app.register(adminRoutes);
+  await app.register(authRoutes);
   await app.register(walletRoutes);
   await app.ready();
   return app;

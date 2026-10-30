@@ -90,6 +90,40 @@ export const otpRequestSchema = z.object({ identifier: z.string().trim().min(3).
 export const otpVerifySchema = z.object({ identifier: z.string().trim().min(3).max(120), code: z.string().trim().length(6) });
 export const adminLoginSchema = z.object({ username: z.string().trim().min(3).max(60), password: z.string().min(1).max(72) });
 
+/**
+ * Password-reset request schema (Prompt 14).
+ *
+ * The body is just an `identifier` (phone OR email — the backend resolves
+ * it). The response is ALWAYS generic ("if the identifier exists, a
+ * reset link was sent") to prevent account enumeration.
+ */
+export const passwordResetRequestSchema = z.object({
+  identifier: z.string().trim().min(3).max(120),
+});
+
+/**
+ * Password-reset confirm schema (Prompt 14).
+ *
+ * Requires the raw `token` returned to the user out-of-band (email/SMS
+ * — currently surfaced in the API response for dev; production should
+ * swap `deliverOtp`/`deliverResetToken` for a real gateway). The new
+ * password follows the same rules as registration.
+ */
+export const passwordResetConfirmSchema = z.object({
+  token: z.string().trim().min(16).max(128),
+  password: z.string().min(6).max(72),
+});
+
+/** Check if an identifier looks like an email (used by the client for UX hints). */
+export function isEmailLike(s: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
+}
+
+/** Check if an identifier looks like a phone (used by the client for UX hints). */
+export function isPhoneLike(s: string): boolean {
+  return /^\+?[0-9]{8,15}$/.test(s.trim());
+}
+
 // --- Rooms ---
 export const createRoomSchema = z.object({
   title: z.string().trim().min(2).max(80),
