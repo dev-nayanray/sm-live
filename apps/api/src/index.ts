@@ -14,6 +14,7 @@ import { agencyRoutes } from "./routes/v1/agencies.js";
 import { gameRoutes } from "./routes/v1/games.js";
 import { contentRoutes } from "./routes/v1/content.js";
 import { feedRoutes } from "./routes/v1/feed.js";
+import { messageRoutes } from "./routes/v1/messages.js";
 import { adminRoutes } from "./routes/admin/index.js";
 import { adminResourceRoutes } from "./routes/admin/resources.js";
 import { providerRoutes } from "./routes/provider.js";
@@ -84,6 +85,7 @@ async function main() {
   await app.register(gameRoutes);
   await app.register(contentRoutes);
   await app.register(feedRoutes);
+  await app.register(messageRoutes);
   await app.register(adminRoutes);
   await app.register(adminResourceRoutes);
   await app.register(providerRoutes);

@@ -48,6 +48,32 @@ export function initSocket(httpServer: HttpServer) {
       void broadcastViewerCount(Number(roomId));
     });
 
+    // Direct messaging (Prompt 19) — join a conversation's socket room
+    // to receive dm:message + dm:read events. The conversation ID is used
+    // directly as the room name (no "room:" prefix so it doesn't collide
+    // with the room-based chat). Membership is validated server-side.
+    socket.on("dm:join", async (conversationId: number, ack?: (r: unknown) => void) => {
+      const membership = await prisma.conversationParticipant.findUnique({
+        where: { conversationId_userId: { conversationId: Number(conversationId), userId } },
+      });
+      if (!membership || membership.leftAt) return ack?.({ ok: false, error: "not a participant" });
+      await socket.join(String(conversationId));
+      ack?.({ ok: true });
+    });
+
+    socket.on("dm:leave", (conversationId: number) => {
+      void socket.leave(String(conversationId));
+    });
+
+    // Typing indicator — relayed to the conversation room.
+    socket.on("dm:typing", (payload: { conversationId: number; typing: boolean }) => {
+      io?.to(String(payload.conversationId)).emit("dm:typing", {
+        conversationId: payload.conversationId,
+        userId,
+        typing: payload.typing,
+      });
+    });
+
     socket.on("chat:send", async (msg: { roomId: number; text: string }, ack?: (r: unknown) => void) => {
       const text = String(msg?.text ?? "").trim().slice(0, 300);
       if (!text) return ack?.({ ok: false });

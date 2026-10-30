@@ -1,188 +1,288 @@
-import { Link, router } from "expo-router";
-import { useEffect, useState } from "react";
-import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
-import { io, type Socket } from "socket.io-client";
-import { api, tokenStore } from "../../src/api/client";
-import { API_BASE } from "../../src/api/env";
+import { router } from "expo-router";
+import { useState } from "react";
+import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { useAuth } from "../../src/state/AppProviders";
-import { Avatar, Badge, Card, EmptyState, SectionHeader, theme, t, spacing } from "../../src/components";
+import {
+  Avatar, EmptyState, ErrorState, Loading, TopHeader,
+  theme, t, spacing, radius,
+} from "../../src/components";
+import { useConversations } from "../../src/hooks/useConversations";
+import {
+  formatMessageTime, getMessagePreview,
+  getConversationTitle, getConversationAvatar, filterConversations,
+  type ConversationListItem,
+} from "../../src/hooks/chatPure";
 
 /**
- * SM Live — Messages screen (Prompt 13).
+ * SM Live — Messages tab (Prompt 19).
  *
- * The platform does NOT yet have a 1:1 / group DM backend. This screen
- * surfaces two real things the user CAN act on today:
+ * Real conversation list backed by /v1/messages/conversations. Replaces
+ * the Prompt 13 placeholder that showed the lobby + recent rooms. The
+ * conversation list updates in real-time via the useConversations hook
+ * which subscribes to dm:message socket events.
  *
- *   1. A global lobby room (Socket.IO roomId=0) — listed as a single
- *      "conversation" so the user can jump into the live lobby. Tapping
- *      opens the existing chat view (now at /chat/[lobby]) which still
- *      runs the socket.io lobby.
- *
- *   2. Recent rooms the user has joined — surfaced as "Recent rooms"
- *      because we don't have a conversations table. Tapping opens the
- *      room detail.
- *
- * Both sections render real data. The conversation-list visual is in
- * place so when a real DM backend lands, the rows swap from "room host"
- * metadata to "latest message preview" without restructuring the screen.
- *
- * Until then, the screen clearly documents the integration boundary so
- * a user never thinks they're looking at fake messages.
+ * Features:
+ *   - TopHeader with brand + search + notifications + wallet + avatar.
+ *   - Category tabs: All / Private / Unread.
+ *   - "New chat" button → /chat/new (search for a user to start a DM).
+ *   - Pull-to-refresh.
+ *   - Real-time conversation preview updates.
+ *   - Per-conversation: avatar, name, last message preview, timestamp,
+ *     unread badge.
+ *   - Tapping a conversation → /chat/[conversationId].
+ *   - Loading / empty / error states.
  */
-interface Msg { from: { id: number; displayName: string }; text: string; ts: number }
-interface Room {
-  id: number; title: string; type: string; audienceCount: number;
-  host: { id: number; displayName: string; avatarUrl: string };
-}
 
-export default function Messages() {
-  const { loggedIn } = useAuth();
-  const [rooms, setRooms] = useState<Room[]>([]);
-  const [lobbyPreview, setLobbyPreview] = useState<Msg | null>(null);
+type Category = "all" | "private" | "unread";
 
-  // Load recent rooms the user might be interested in (open rooms list —
-  // we don't yet have a per-user "rooms you joined" endpoint, so this is
-  // the closest real signal).
-  useEffect(() => {
-    if (!loggedIn) return;
-    api<Room[]>("/v1/rooms").then(setRooms).catch(() => setRooms([]));
-  }, [loggedIn]);
+const CATEGORIES: Array<{ key: Category; label: string }> = [
+  { key: "all", label: "All" },
+  { key: "private", label: "Private" },
+  { key: "unread", label: "Unread" },
+];
 
-  // Listen to the lobby for the latest message preview.
-  useEffect(() => {
-    if (!loggedIn) return;
-    let s: Socket | null = null;
-    (async () => {
-      const tokens = await tokenStore.get();
-      s = io(API_BASE, { auth: { token: tokens?.accessToken }, transports: ["websocket"] });
-      s.on("connect", () => s?.emit("room:join", 0, () => {}));
-      s.on("chat:message", (m: Msg) => setLobbyPreview(m));
-    })();
-    return () => { s?.disconnect(); };
-  }, [loggedIn]);
+export default function MessagesTab() {
+  const { loggedIn, user } = useAuth();
+  const { conversations, loading, refreshing, error, refresh } = useConversations(loggedIn);
+  const [category, setCategory] = useState<Category>("all");
 
   if (!loggedIn) {
     return (
-      <View style={s.center}>
-        <EmptyState
-          icon="🔐"
-          title="Sign in to see your messages"
-          subtitle="Conversations, group chats, and the global lobby are available once you're signed in."
-          ctaLabel="Sign in"
-          onCta={() => router.replace("/auth/login")}
-        />
+      <View style={s.root}>
+        <TopHeader />
+        <View style={s.center}>
+          <EmptyState
+            icon="🔐"
+            title="Sign in to see your messages"
+            subtitle="Private conversations, group chats, and real-time messaging."
+            ctaLabel="Sign in"
+            onCta={() => router.replace("/auth/welcome")}
+          />
+        </View>
       </View>
     );
   }
 
-  const recentRooms = rooms.slice(0, 8);
+  const filtered = filterConversations(conversations, "", category);
 
   return (
     <View style={s.root}>
-      <View style={s.header}>
+      <TopHeader />
+      <View style={s.headerRow}>
         <Text style={s.title}>Messages</Text>
-        <Badge tone="muted" label={`${recentRooms.length} active`} />
+        <Pressable style={s.newBtn} onPress={() => router.push("/chat/new")}>
+          <Text style={s.newBtnText}>+ New</Text>
+        </Pressable>
+      </View>
+      <View style={s.tabs}>
+        {CATEGORIES.map((c) => (
+          <Pressable
+            key={c.key}
+            onPress={() => setCategory(c.key)}
+            style={[s.tab, category === c.key && s.tabActive]}
+          >
+            <Text style={[s.tabText, category === c.key && s.tabTextActive]}>{c.label}</Text>
+          </Pressable>
+        ))}
       </View>
 
-      <FlatList
-        data={recentRooms}
-        keyExtractor={(r) => String(r.id)}
-        ListHeaderComponent={
-          <>
-            <SectionHeader title="Lobby" icon="💬" />
-            <Link href="/chat/lobby" asChild>
-              <Pressable>
-                <Card variant="hero" style={s.lobbyCard}>
-                  <View style={s.convRow}>
-                    <Avatar name="Lobby" size={48} />
-                    <View style={s.convInfo}>
-                      <Text style={s.convName}>Global lobby</Text>
-                      <Text style={s.convPreview} numberOfLines={1}>
-                        {lobbyPreview
-                          ? `${lobbyPreview.from.displayName}: ${lobbyPreview.text}`
-                          : "Tap to join the live chat — say hi 👋"}
-                      </Text>
-                    </View>
-                    <Badge tone="accent" label="LIVE" />
-                  </View>
-                </Card>
-              </Pressable>
-            </Link>
-
-            <SectionHeader title="Recent rooms" icon="🏠" />
-            <Text style={s.helper}>Direct messages are coming soon. For now, jump back into a room you visited.</Text>
-          </>
-        }
-        ListEmptyComponent={
-          <EmptyState
-            icon="📭"
-            title="No conversations yet"
-            subtitle="Open rooms from the Live tab to start chatting with hosts and other users."
-            ctaLabel="Browse live rooms"
-            onCta={() => router.push("/(tabs)/live")}
-          />
-        }
-        renderItem={({ item }) => (
-          <Link href={`/room/${item.id}`} asChild>
-            <Pressable>
-              <Card style={s.convCard}>
-                <View style={s.convRow}>
-                  <Avatar name={item.host.displayName} imageUrl={item.host.avatarUrl} size={48} />
-                  <View style={s.convInfo}>
-                    <Text style={s.convName} numberOfLines={1}>{item.title}</Text>
-                    <Text style={s.convPreview} numberOfLines={1}>
-                      host {item.host.displayName} · 👥 {item.audienceCount}
-                    </Text>
-                  </View>
-                  <Text style={s.convTime}>now</Text>
-                </View>
-              </Card>
-            </Pressable>
-          </Link>
-        )}
-        contentContainerStyle={{ paddingBottom: spacing[6] }}
-      />
+      {loading ? (
+        <Loading label="Loading conversations…" />
+      ) : error ? (
+        <ErrorState
+          title="Couldn't load messages"
+          subtitle="Pull down to retry."
+          technical={error}
+          ctaLabel="Retry"
+          onCta={() => void refresh()}
+        />
+      ) : filtered.length === 0 ? (
+        <EmptyState
+          icon="💬"
+          title={category === "unread" ? "No unread messages" : "No conversations yet"}
+          subtitle={category === "unread"
+            ? "You're all caught up!"
+            : "Tap '+ New' to start a conversation with someone."}
+          ctaLabel={category === "all" ? "Start a chat" : undefined}
+          onCta={category === "all" ? () => router.push("/chat/new") : undefined}
+        />
+      ) : (
+        <FlatList
+          data={filtered}
+          keyExtractor={(item) => String(item.id)}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={theme.primary} />}
+          contentContainerStyle={{ paddingVertical: spacing[2] }}
+          renderItem={({ item }) => (
+            <ConversationRow conv={item} currentUserId={user?.id ?? 0} />
+          )}
+        />
+      )}
     </View>
+  );
+}
+
+function ConversationRow({ conv, currentUserId }: { conv: ConversationListItem; currentUserId: number }) {
+  const title = getConversationTitle(conv, currentUserId);
+  const avatar = getConversationAvatar(conv, currentUserId);
+  const preview = getMessagePreview(conv.lastMessage);
+  const time = conv.lastMessageAt ? formatMessageTime(conv.lastMessageAt) : "";
+  const isGroup = conv.type === "group";
+
+  return (
+    <Pressable
+      style={({ pressed }) => [s.row, pressed && { opacity: 0.7 }]}
+      onPress={() => router.push(`/chat/${conv.id}`)}
+    >
+      <View style={s.avatarWrap}>
+        <Avatar
+          name={title}
+          imageUrl={avatar || undefined}
+          size={48}
+          vipLevel={conv.participants.find((p) => p.userId !== currentUserId)?.vipLevel}
+        />
+        {isGroup && <View style={s.groupBadge}><Text style={s.groupBadgeText}>👥</Text></View>}
+      </View>
+      <View style={s.rowBody}>
+        <View style={s.rowHeader}>
+          <Text style={s.rowTitle} numberOfLines={1}>{title}</Text>
+          <Text style={s.rowTime}>{time}</Text>
+        </View>
+        <View style={s.rowFooter}>
+          <Text style={[s.rowPreview, conv.unread > 0 && s.rowPreviewUnread]} numberOfLines={1}>
+            {conv.lastMessage?.senderId === currentUserId ? "You: " : ""}
+            {preview}
+          </Text>
+          {conv.unread > 0 && (
+            <View style={s.unreadBadge}>
+              <Text style={s.unreadText}>{conv.unread > 99 ? "99+" : conv.unread}</Text>
+            </View>
+          )}
+          {conv.muted && <Text style={s.mutedIcon}>🔕</Text>}
+        </View>
+      </View>
+    </Pressable>
   );
 }
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: theme.bg },
-  center: { flex: 1, backgroundColor: theme.bg, justifyContent: "center" },
-  header: {
+  center: { flex: 1, justifyContent: "center" },
+  headerRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: spacing[4],
-    paddingVertical: spacing[3],
+    paddingVertical: spacing[2],
   },
   title: { ...t.h1, color: theme.text },
-  lobbyCard: { marginHorizontal: 0 },
-  convCard: { marginHorizontal: 0, marginBottom: spacing[1] },
-  convRow: {
+  newBtn: {
+    backgroundColor: theme.primary,
+    paddingHorizontal: spacing[3],
+    paddingVertical: spacing[1],
+    borderRadius: radius.pill,
+  },
+  newBtnText: {
+    ...t.caption,
+    color: theme.textInverse,
+    fontWeight: "700",
+  },
+  tabs: {
+    flexDirection: "row",
+    gap: spacing[2],
+    paddingHorizontal: spacing[4],
+    paddingBottom: spacing[2],
+  },
+  tab: {
+    paddingHorizontal: spacing[3],
+    paddingVertical: spacing[1],
+    borderRadius: radius.pill,
+    backgroundColor: theme.surface,
+    borderWidth: 1,
+    borderColor: theme.border,
+  },
+  tabActive: {
+    backgroundColor: theme.primary,
+    borderColor: theme.primary,
+  },
+  tabText: {
+    ...t.caption,
+    color: theme.textMuted,
+    fontWeight: "600",
+  },
+  tabTextActive: {
+    color: theme.textInverse,
+  },
+  row: {
     flexDirection: "row",
     alignItems: "center",
+    paddingHorizontal: spacing[4],
+    paddingVertical: spacing[2],
     gap: spacing[3],
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border,
   },
-  convInfo: { flex: 1 },
-  convName: {
+  avatarWrap: {
+    position: "relative",
+  },
+  groupBadge: {
+    position: "absolute",
+    bottom: -2,
+    right: -2,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: theme.primary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  groupBadgeText: { fontSize: 10 },
+  rowBody: {
+    flex: 1,
+    gap: spacing[1],
+  },
+  rowHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  rowTitle: {
     ...t.body,
     color: theme.text,
     fontWeight: "700",
+    flex: 1,
   },
-  convPreview: {
-    ...t.caption,
-    color: theme.textSubtle,
-    marginTop: 2,
-  },
-  convTime: {
+  rowTime: {
     ...t.micro,
     color: theme.textSubtle,
   },
-  helper: {
+  rowFooter: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing[1],
+  },
+  rowPreview: {
     ...t.caption,
     color: theme.textSubtle,
-    paddingHorizontal: spacing[4],
-    marginBottom: spacing[2],
+    flex: 1,
   },
+  rowPreviewUnread: {
+    color: theme.text,
+    fontWeight: "600",
+  },
+  unreadBadge: {
+    minWidth: 20,
+    height: 20,
+    paddingHorizontal: 6,
+    borderRadius: 10,
+    backgroundColor: theme.accent,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  unreadText: {
+    color: theme.textInverse,
+    fontSize: 10,
+    fontWeight: "800",
+  },
+  mutedIcon: { fontSize: 12 },
 });

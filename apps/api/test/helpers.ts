@@ -5,6 +5,7 @@ import { adminRoutes } from "../src/routes/admin/index.js";
 import { authRoutes } from "../src/routes/v1/auth.js";
 import { walletRoutes } from "../src/routes/v1/wallet.js";
 import { feedRoutes } from "../src/routes/v1/feed.js";
+import { messageRoutes } from "../src/routes/v1/messages.js";
 import { setErrorHandler } from "../src/lib/errors.js";
 
 export async function buildTestApp(): Promise<FastifyInstance> {
@@ -24,6 +25,7 @@ export async function buildTestApp(): Promise<FastifyInstance> {
   await app.register(authRoutes);
   await app.register(walletRoutes);
   await app.register(feedRoutes);
+  await app.register(messageRoutes);
   await app.ready();
   return app;
 }

@@ -46,6 +46,8 @@ model User {
   passwordResets PasswordResetToken[]
   agencyMembers  AgencyMember[]
   adminNotes     AdminNote[]
+  conversations  ConversationParticipant[]
+  sentMessages   DirectMessage[] @relation("MessageSender")
 
   @@index([agencyId])
   @@index([marketCode])
@@ -1103,4 +1105,76 @@ model SystemAlert {
   @@index([status, severity])
   @@index([source, fingerprint])
   @@index([createdAt])
+}
+
+// ===========================================================================
+// Direct Messaging (Prompt 19)
+// ===========================================================================
+
+/**
+ * Conversation — a private 1:1 or group chat. `type` is "private" (1:1)
+ * or "group". `title` is used for group chats (empty for 1:1).
+ * `lastMessageAt` is updated on every new message so the conversation
+ * list can be sorted by recency without a join.
+ */
+model Conversation {
+  id           Int       @id @default(autoincrement())
+  type         String    @default("private") // private | group
+  title        String    @default("")
+  createdAt    DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  lastMessageAt DateTime?
+
+  participants ConversationParticipant[]
+  messages     DirectMessage[]
+
+  @@index([type])
+  @@index([lastMessageAt])
+}
+
+/**
+ * ConversationParticipant — a user's membership in a conversation.
+ * `role` is "admin" (group creator) or "member". `lastReadAt` tracks
+ * read receipts (null = never read). `muted` + `pinned` are per-user
+ * preferences. `leftAt` marks a user who left a group (their messages
+ * remain; they just can't see new ones).
+ */
+model ConversationParticipant {
+  id             Int       @id @default(autoincrement())
+  conversationId Int
+  userId         Int
+  role           String    @default("member") // admin | member
+  lastReadAt     DateTime?
+  muted          Boolean   @default(false)
+  pinned         Boolean   @default(false)
+  joinedAt       DateTime  @default(now())
+  leftAt         DateTime?
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+  @@index([userId])
+  @@index([conversationId])
+}
+
+/**
+ * DirectMessage — a single message in a conversation. `body` is text
+ * (300 chars max, matching the room chat limit). Attachments, reactions,
+ * and edits are future extensions — the table is designed so adding a
+ * `replyToId`, `editedAt`, or `attachmentUrl` column doesn't break the
+ * existing query patterns.
+ */
+model DirectMessage {
+  id             Int      @id @default(autoincrement())
+  conversationId Int
+  senderId       Int
+  body           String   @default("")
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User         @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@index([senderId])
 }
