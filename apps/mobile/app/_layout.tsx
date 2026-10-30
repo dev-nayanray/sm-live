@@ -62,6 +62,12 @@ function ThemedStack() {
         <Stack.Screen name="gifts/store" options={{ title: "Gift Store", headerShown: false }} />
         <Stack.Screen name="gifts/sent" options={{ title: "Gifts Sent", headerShown: false }} />
         <Stack.Screen name="gifts/received" options={{ title: "Gifts Received", headerShown: false }} />
+        <Stack.Screen name="profile/edit" options={{ title: "Edit Profile", headerShown: false }} />
+        <Stack.Screen name="profile/[userId]" options={{ title: "Profile", headerShown: false }} />
+        <Stack.Screen name="profile/[userId]/followers" options={{ title: "Followers", headerShown: false }} />
+        <Stack.Screen name="profile/[userId]/following" options={{ title: "Following", headerShown: false }} />
+        <Stack.Screen name="profile/[userId]/report" options={{ title: "Report User", headerShown: false }} />
+        <Stack.Screen name="profile/blocked" options={{ title: "Blocked Users", headerShown: false }} />
         <Stack.Screen name="live/start" options={{ title: "Start Live", headerShown: false }} />
       </Stack>
     </>

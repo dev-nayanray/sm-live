@@ -48,6 +48,12 @@ model User {
   adminNotes     AdminNote[]
   conversations  ConversationParticipant[]
   sentMessages   DirectMessage[] @relation("MessageSender")
+  following      Follow[]         @relation("FollowFollower")
+  followers      Follow[]         @relation("FollowFollowing")
+  blocks         UserBlock[]      @relation("BlockBlocker")
+  blockedBy      UserBlock[]      @relation("BlockBlocked")
+  reportsMade    UserReport[]     @relation("ReportReporter")
+  reportsAgainst UserReport[]     @relation("ReportReported")
 
   @@index([agencyId])
   @@index([marketCode])
@@ -1177,4 +1183,53 @@ model DirectMessage {
 
   @@index([conversationId, createdAt])
   @@index([senderId])
+}
+
+// ===========================================================================
+// Social Connections (Prompt 16)
+// ===========================================================================
+
+model Follow {
+  id          Int      @id @default(autoincrement())
+  followerId  Int
+  followingId Int
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("FollowFollower", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("FollowFollowing", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@unique([followerId, followingId])
+  @@index([followerId])
+  @@index([followingId])
+}
+
+model UserBlock {
+  id         Int      @id @default(autoincrement())
+  blockerId  Int
+  blockedId  Int
+  createdAt  DateTime @default(now())
+
+  blocker User @relation("BlockBlocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("BlockBlocked", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedId])
+  @@index([blockerId])
+  @@index([blockedId])
+}
+
+model UserReport {
+  id         Int      @id @default(autoincrement())
+  reporterId Int
+  reportedId Int
+  reason     String   @default("other")
+  details    String   @default("")
+  status     String   @default("open")
+  createdAt  DateTime @default(now())
+
+  reporter User @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  reported User @relation("ReportReported", fields: [reportedId], references: [id], onDelete: Cascade)
+
+  @@index([reporterId])
+  @@index([reportedId])
+  @@index([status])
 }
