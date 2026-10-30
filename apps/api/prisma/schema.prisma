@@ -41,6 +41,7 @@ model User {
   roomsCreated   Room[]              @relation("RoomHost")
   participations RoomParticipant[]
   complaints     Complaint[]
+  supportTickets SupportTicket[]
   refreshTokens  Session[]
   agencyMembers  AgencyMember[]
   adminNotes     AdminNote[]
@@ -95,6 +96,8 @@ model AdminUser {
   auditLogs  AuditLog[]
   refunds    Refund[]
   adminNotes AdminNote[]
+  assignedTickets  SupportTicket[] @relation("TicketAssignee")
+  ticketMessages   TicketMessage[]
 
   @@index([roleId])
 }
@@ -784,4 +787,54 @@ model DailyRevenue {
   giftsAmount Int      @default(0)
   recharges   Int      @default(0)
   revenue     Int      @default(0) // bets - wins (house coin margin)
+}
+
+// ===========================================================================
+// Support tickets (Prompt 11)
+// ===========================================================================
+
+/**
+ * Support ticket — created by users (via API) or by admins on behalf of users.
+ * Tracks subject, category, priority, status, and assignment.
+ */
+model SupportTicket {
+  id          Int       @id @default(autoincrement())
+  userId      Int
+  subject     String
+  description String    @default("")
+  category    String    @default("other")
+  priority    String    @default("normal") // low | normal | high | urgent
+  status      String    @default("new") // new | open | in_progress | waiting_user | waiting_internal | escalated | resolved | closed
+  assigneeId  Int?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user       User       @relation(fields: [userId], references: [id])
+  assignee   AdminUser? @relation("TicketAssignee", fields: [assigneeId], references: [id])
+  messages   TicketMessage[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([priority])
+  @@index([assigneeId])
+  @@index([createdAt])
+}
+
+/**
+ * Ticket message — either a customer-facing reply or an internal note.
+ * Internal notes are NEVER exposed to users through the user-facing API.
+ */
+model TicketMessage {
+  id         Int      @id @default(autoincrement())
+  ticketId   Int
+  authorId   Int?     // null = user; non-null = admin
+  authorType String   @default("user") // user | admin
+  body       String
+  isInternal Boolean  @default(false) // internal notes never exposed to users
+  createdAt  DateTime @default(now())
+
+  ticket     SupportTicket @relation(fields: [ticketId], references: [id])
+  author     AdminUser?    @relation(fields: [authorId], references: [id])
+
+  @@index([ticketId, createdAt])
 }

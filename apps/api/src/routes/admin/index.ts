@@ -2605,6 +2605,213 @@ export async function adminRoutes(app: FastifyInstance) {
     return { ok: true, data: after };
   });
 
+  // --- Support Tickets (Prompt 11) ---------------------------------------
+  //
+  // Full ticket management: list, create, detail, update (status/priority/
+  // assignee), conversation (messages + internal notes).
+  //
+  // Permissions:
+  //   - players.read  — view tickets + complaints
+  //   - players.write — create/update tickets, reply, add internal notes
+
+  app.get("/v1/admin/support/summary", async (req) => {
+    await requireAdmin(req, "players.read");
+    const [totalTickets, newTickets, openTickets, inProgressTickets, waitingTickets, resolvedTickets, closedTickets, escalatedTickets, unassignedTickets, totalComplaints, openComplaints, resolvedComplaints, rejectedComplaints] = await Promise.all([
+      prisma.supportTicket.count(),
+      prisma.supportTicket.count({ where: { status: "new" } }),
+      prisma.supportTicket.count({ where: { status: "open" } }),
+      prisma.supportTicket.count({ where: { status: "in_progress" } }),
+      prisma.supportTicket.count({ where: { status: { in: ["waiting_user", "waiting_internal"] } } }),
+      prisma.supportTicket.count({ where: { status: "resolved" } }),
+      prisma.supportTicket.count({ where: { status: "closed" } }),
+      prisma.supportTicket.count({ where: { status: "escalated" } }),
+      prisma.supportTicket.count({ where: { assigneeId: null, status: { notIn: ["resolved", "closed"] } } }),
+      prisma.complaint.count(),
+      prisma.complaint.count({ where: { status: "open" } }),
+      prisma.complaint.count({ where: { status: "resolved" } }),
+      prisma.complaint.count({ where: { status: "rejected" } }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        tickets: { total: totalTickets, new: newTickets, open: openTickets, inProgress: inProgressTickets, waiting: waitingTickets, resolved: resolvedTickets, closed: closedTickets, escalated: escalatedTickets, unassigned: unassignedTickets },
+        complaints: { total: totalComplaints, open: openComplaints, resolved: resolvedComplaints, rejected: rejectedComplaints },
+        // No SLA tracking table exists.
+        hasSLA: false,
+        // No customer satisfaction collection.
+        hasSatisfaction: false,
+        // No notification delivery infrastructure.
+        hasNotificationService: false,
+      },
+    };
+  });
+
+  app.get("/v1/admin/support/tickets", async (req) => {
+    await requireAdmin(req, "players.read");
+    const q = validate(paginationQuery.extend({
+      status: z.string().trim().max(30).optional(),
+      priority: z.string().trim().max(20).optional(),
+      category: z.string().trim().max(40).optional(),
+      assigneeId: z.coerce.number().int().optional(),
+    }), queryOf(req));
+    const where: Prisma.SupportTicketWhereInput = {};
+    if (q.search) {
+      const n = Number(q.search);
+      if (!Number.isNaN(n) && Number.isInteger(n)) where.userId = n;
+      else where.subject = { contains: q.search, mode: "insensitive" };
+    }
+    if (q.status) where.status = q.status;
+    if (q.priority) where.priority = q.priority;
+    if (q.category) where.category = q.category;
+    if (q.assigneeId) where.assigneeId = q.assigneeId;
+    const [total, items] = await Promise.all([
+      prisma.supportTicket.count({ where }),
+      prisma.supportTicket.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          user: { select: { id: true, displayName: true } },
+          assignee: { select: { id: true, displayName: true } },
+          _count: { select: { messages: true } },
+        },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((t) => ({
+          id: t.id,
+          userId: t.userId,
+          username: t.user?.displayName ?? "—",
+          subject: t.subject,
+          category: t.category,
+          priority: t.priority,
+          status: t.status,
+          assigneeId: t.assigneeId,
+          assignee: t.assignee?.displayName ?? null,
+          messageCount: t._count.messages,
+          createdAt: t.createdAt.toISOString(),
+          updatedAt: t.updatedAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/support/tickets/:id", async (req) => {
+    await requireAdmin(req, "players.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const ticket = await prisma.supportTicket.findUnique({
+      where: { id },
+      include: {
+        user: { select: { id: true, displayName: true, phone: true, email: true, country: true, createdAt: true } },
+        assignee: { select: { id: true, displayName: true, username: true } },
+        messages: { orderBy: { id: "asc" }, include: { author: { select: { id: true, displayName: true, username: true } } } },
+      },
+    });
+    if (!ticket) throw notFound("ticket not found");
+    return {
+      ok: true,
+      data: {
+        ticket: {
+          id: ticket.id,
+          userId: ticket.userId,
+          subject: ticket.subject,
+          description: ticket.description,
+          category: ticket.category,
+          priority: ticket.priority,
+          status: ticket.status,
+          assigneeId: ticket.assigneeId,
+          assignee: ticket.assignee ? { id: ticket.assignee.id, displayName: ticket.assignee.displayName, username: ticket.assignee.username } : null,
+          createdAt: ticket.createdAt.toISOString(),
+          updatedAt: ticket.updatedAt.toISOString(),
+        },
+        user: ticket.user ? {
+          id: ticket.user.id,
+          displayName: ticket.user.displayName,
+          phone: ticket.user.phone,
+          email: ticket.user.email,
+          country: ticket.user.country,
+          createdAt: ticket.user.createdAt.toISOString(),
+        } : null,
+        messages: ticket.messages.map((m) => ({
+          id: m.id,
+          authorType: m.authorType,
+          authorId: m.authorId,
+          authorName: m.author?.displayName ?? "User",
+          body: m.body,
+          isInternal: m.isInternal,
+          createdAt: m.createdAt.toISOString(),
+        })),
+      },
+    };
+  });
+
+  app.post("/v1/admin/support/tickets", async (req) => {
+    const admin = await requireAdmin(req, "players.write");
+    const input = validate(z.object({
+      userId: z.coerce.number().int().positive(),
+      subject: z.string().trim().min(2).max(200),
+      description: z.string().trim().max(5000).default(""),
+      category: z.string().trim().max(40).default("other"),
+      priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"),
+    }), bodyOf(req));
+    const user = await prisma.user.findUnique({ where: { id: input.userId }, select: { id: true } });
+    if (!user) throw notFound("user not found");
+    const ticket = await prisma.supportTicket.create({ data: input });
+    await writeAudit({ adminId: admin.id, req, action: "create_ticket", entity: "support_ticket", entityId: ticket.id, after: { subject: ticket.subject, userId: input.userId } });
+    return { ok: true, data: { id: ticket.id, subject: ticket.subject } };
+  });
+
+  app.patch("/v1/admin/support/tickets/:id", async (req) => {
+    const admin = await requireAdmin(req, "players.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      status: z.enum(["new", "open", "in_progress", "waiting_user", "waiting_internal", "escalated", "resolved", "closed"]).optional(),
+      priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
+      assigneeId: z.coerce.number().int().nullable().optional(),
+      category: z.string().trim().max(40).optional(),
+    }), bodyOf(req));
+    const before = await prisma.supportTicket.findUnique({ where: { id } });
+    if (!before) throw notFound("ticket not found");
+    if (input.assigneeId) {
+      const assignee = await prisma.adminUser.findUnique({ where: { id: input.assigneeId }, select: { id: true, active: true } });
+      if (!assignee) throw badRequest("unknown admin user");
+      if (!assignee.active) throw badRequest("admin user is inactive");
+    }
+    const after = await prisma.supportTicket.update({ where: { id }, data: input });
+    await writeAudit({
+      adminId: admin.id, req,
+      action: "update_ticket",
+      entity: "support_ticket", entityId: id,
+      before: { status: before.status, priority: before.priority, assigneeId: before.assigneeId },
+      after: { status: after.status, priority: after.priority, assigneeId: after.assigneeId },
+    });
+    return { ok: true, data: { id: after.id, status: after.status, priority: after.priority, assigneeId: after.assigneeId } };
+  });
+
+  app.post("/v1/admin/support/tickets/:id/messages", async (req) => {
+    const admin = await requireAdmin(req, "players.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      body: z.string().trim().min(1).max(5000),
+      isInternal: z.boolean().default(false),
+    }), bodyOf(req));
+    const ticket = await prisma.supportTicket.findUnique({ where: { id }, select: { id: true, status: true } });
+    if (!ticket) throw notFound("ticket not found");
+    const message = await prisma.ticketMessage.create({
+      data: { ticketId: id, authorId: admin.id, authorType: "admin", body: input.body, isInternal: input.isInternal },
+    });
+    // If it's a customer-facing reply, move ticket to waiting_user.
+    if (!input.isInternal && ticket.status === "open") {
+      await prisma.supportTicket.update({ where: { id }, data: { status: "waiting_user" } });
+    }
+    await writeAudit({ adminId: admin.id, req, action: input.isInternal ? "add_internal_note" : "reply_ticket", entity: "support_ticket", entityId: id, after: { messageId: message.id, isInternal: input.isInternal } });
+    return { ok: true, data: { id: message.id, isInternal: input.isInternal } };
+  });
+
   app.get("/v1/admin/suspicious", async (req) => {
     await requireAdmin(req, "security.read");
     const q = validate(paginationQuery, queryOf(req));
