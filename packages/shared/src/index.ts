@@ -377,6 +377,37 @@ export const roomListQuerySchema = paginationQuery.extend({
 });
 export type RoomListQuery = z.infer<typeof roomListQuerySchema>;
 
+// ---------------------------------------------------------------------------
+// Game & provider management (Prompt 06)
+// ---------------------------------------------------------------------------
+
+export const GAME_STATUS_ACTIONS = ["activate", "disable", "maintenance"] as const;
+
+export const gameStatusChangeSchema = z.object({
+  action: z.enum(GAME_STATUS_ACTIONS),
+  reason: z.string().trim().min(1).max(300),
+});
+
+export const gameListQuerySchema = paginationQuery.extend({
+  status: z.enum(GAME_STATUSES).optional(),
+  providerId: z.coerce.number().int().positive().optional(),
+  isPro: z.enum(["true", "false"]).optional(),
+});
+export type GameListQuery = z.infer<typeof gameListQuerySchema>;
+
+export const providerListQuerySchema = paginationQuery.extend({
+  enabled: z.enum(["true", "false"]).optional(),
+});
+export type ProviderListQuery = z.infer<typeof providerListQuerySchema>;
+
+export const sessionListQuerySchema = paginationQuery.extend({
+  gameId: z.coerce.number().int().positive().optional(),
+  userId: z.coerce.number().int().positive().optional(),
+  status: z.enum(["open", "closed"]).optional(),
+  providerId: z.coerce.number().int().positive().optional(),
+});
+export type SessionListQuery = z.infer<typeof sessionListQuerySchema>;
+
 // --- Public app config (response of GET /v1/config/app) ---
 export interface AppConfigGift { id: number; name: string; iconUrl: string; price: number; category: string; animation: string; }
 export interface AppConfigGame { code: string; name: string; thumbnailUrl: string; isPro: boolean; status: string; minBet: number; maxBet: number; }

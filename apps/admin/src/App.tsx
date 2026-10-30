@@ -14,6 +14,9 @@ import { UserDetail } from "./pages/UserDetail";
 import { Agencies } from "./pages/Agencies";
 import { AgencyDetail } from "./pages/AgencyDetail";
 import { Games } from "./pages/Games";
+import { GameManagement } from "./pages/GameManagement";
+import { ProviderManagement } from "./pages/ProviderManagement";
+import { GameSessions } from "./pages/GameSessions";
 import { RoundsBets } from "./pages/RoundsBets";
 import { Wallet } from "./pages/Wallet";
 import { Players } from "./pages/Players";
@@ -62,7 +65,10 @@ function Shell() {
         <Route path="/users/:id" element={<RequirePerm perm="users.read"><UserDetail /></RequirePerm>} />
         <Route path="/agencies" element={<RequirePerm perm="agencies.read"><Agencies /></RequirePerm>} />
         <Route path="/agencies/:id" element={<RequirePerm perm="agencies.read"><AgencyDetail /></RequirePerm>} />
-        <Route path="/games" element={<RequirePerm perm="games.read"><Games /></RequirePerm>} />
+        <Route path="/games" element={<RequirePerm perm="games.read"><GameManagement /></RequirePerm>} />
+        <Route path="/games-content" element={<RequirePerm perm="games.read"><Games /></RequirePerm>} />
+        <Route path="/game-sessions" element={<RequirePerm perm="rounds.read"><GameSessions /></RequirePerm>} />
+        <Route path="/game-providers" element={<RequirePerm perm="providers.read"><ProviderManagement /></RequirePerm>} />
         <Route path="/rounds" element={<RequirePerm perm="rounds.read"><RoundsBets /></RequirePerm>} />
         <Route path="/wallet" element={<RequirePerm perm="wallet.read"><Wallet /></RequirePerm>} />
         <Route path="/players" element={<RequirePerm perm="players.read"><Players /></RequirePerm>} />

@@ -142,25 +142,31 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       {
         to: "/games",
-        label: "Games",
+        label: "Game Management",
         perm: "games.read",
         icon: "joystick",
-        hint: "Game catalogue, provider binding, status (existing page).",
+        hint: "Manage game catalog, availability, and maintenance status.",
+      },
+      {
+        to: "/game-sessions",
+        label: "Game Sessions",
+        perm: "rounds.read",
+        icon: "history",
+        hint: "Monitor active and historical game launch sessions.",
       },
       {
         to: "/rounds",
-        label: "Sessions & History",
+        label: "Rounds & Bets",
         perm: "rounds.read",
         icon: "history",
         hint: "Rounds, bets, settlements & recovery (existing page).",
       },
       {
-        to: null,
+        to: "/game-providers",
         label: "Game Providers",
         perm: "providers.read",
         icon: "plug",
-        planned: true,
-        hint: "Provider catalogue — planned for a later phase (today: Providers & Settlement).",
+        hint: "Manage provider integrations, monitor health, and review API errors.",
       },
       {
         to: null,

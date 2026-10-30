@@ -7,6 +7,7 @@ import {
   maskContact, RESTRICTION_TYPES,
   agencyCreateSchema, agencyUpdateSchema, agencyStatusChangeSchema, agencyListQuerySchema,
   roomReportCreateSchema, roomReportUpdateSchema, roomListQuerySchema,
+  gameStatusChangeSchema, gameListQuerySchema, providerListQuerySchema, sessionListQuerySchema,
 } from "@sm-live/shared";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
@@ -2217,6 +2218,359 @@ export async function adminRoutes(app: FastifyInstance) {
       return { bucket: bucket.toISOString(), bets: Number(r.bets), wins: winsAmt, rounds: Number(r.rounds), revenue: Number(r.bets) - winsAmt };
     });
     return { ok: true, data };
+  });
+
+  // --- Game management (Prompt 06) ----------------------------------------
+  //
+  // Extends the existing game-providers/games/game-configs resource CRUD
+  // with dedicated endpoints for:
+  //   - Game summary KPIs (total, active, maintenance, disabled, Pro, errors)
+  //   - Filtered + paginated game list with provider join
+  //   - Game detail with configs + provider info
+  //   - Game status change (activate / disable / maintenance) with reason +
+  //     audit + enforcement (launchGame already checks game.status)
+  //   - Provider summary KPIs
+  //   - Filtered + paginated provider list (secrets NEVER returned)
+  //   - Provider detail with games + API error count
+  //   - Game session list with filters
+  //   - API error logs with provider filter
+  //
+  // Permissions:
+  //   - games.read / games.write — game management
+  //   - providers.read / providers.write — provider management
+  //   - rounds.read — session + history viewing
+  //   - security.read — API error logs
+
+  app.get("/v1/admin/games/summary", async (req) => {
+    await requireAdmin(req, "games.read");
+    const [total, active, maintenance, disabled, isPro, errorGames24h] = await Promise.all([
+      prisma.game.count(),
+      prisma.game.count({ where: { status: "active" } }),
+      prisma.game.count({ where: { status: "maintenance" } }),
+      prisma.game.count({ where: { status: "disabled" } }),
+      prisma.game.count({ where: { isPro: true } }),
+      // Games with API errors in last 24h — derived from ApiErrorLog.source='provider'
+      prisma.apiErrorLog.count({ where: { createdAt: { gte: new Date(Date.now() - 86_400_000) }, source: "provider" } }),
+    ]);
+    return {
+      ok: true,
+      data: { total, active, maintenance, disabled, isPro, errorGames24h,
+        // No separate game-category model exists in the current schema.
+        hasGameCategories: false,
+      },
+    };
+  });
+
+  app.get("/v1/admin/games", async (req) => {
+    await requireAdmin(req, "games.read");
+    const q = validate(gameListQuerySchema, queryOf(req));
+    const where: Prisma.GameWhereInput = {};
+    if (q.search) {
+      const asNum = Number(q.search);
+      if (!Number.isNaN(asNum) && Number.isInteger(asNum)) {
+        where.id = asNum;
+      } else {
+        where.OR = [
+          { name: { contains: q.search, mode: "insensitive" } },
+          { code: { contains: q.search, mode: "insensitive" } },
+        ];
+      }
+    }
+    if (q.status) where.status = q.status;
+    if (q.providerId) where.providerId = q.providerId;
+    if (q.isPro === "true") where.isPro = true;
+    else if (q.isPro === "false") where.isPro = false;
+
+    const sortWhitelist = ["id", "code", "name", "status", "sortOrder"];
+    const sortBy = q.sortBy && sortWhitelist.includes(q.sortBy) ? q.sortBy : "id";
+    const orderBy = { [sortBy]: q.sortDir } as const;
+
+    const [total, items] = await Promise.all([
+      prisma.game.count({ where }),
+      prisma.game.findMany({
+        where,
+        orderBy,
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          provider: { select: { id: true, name: true, code: true, enabled: true } },
+          _count: { select: { configs: true, sessions: true } },
+        },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((g) => ({
+          id: g.id,
+          code: g.code,
+          name: g.name,
+          version: g.version,
+          status: g.status,
+          isPro: g.isPro,
+          thumbnailUrl: g.thumbnailUrl,
+          sortOrder: g.sortOrder,
+          providerId: g.providerId,
+          provider: g.provider ? { id: g.provider.id, name: g.provider.name, code: g.provider.code, enabled: g.provider.enabled } : null,
+          configCount: g._count.configs,
+          sessionCount: g._count.sessions,
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/games/:id", async (req) => {
+    await requireAdmin(req, "games.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const game = await prisma.game.findUnique({
+      where: { id },
+      include: {
+        provider: { select: { id: true, name: true, code: true, apiBase: true, enabled: true, commissionPct: true } },
+        configs: { include: { market: { select: { id: true, code: true, name: true } } } },
+        _count: { select: { sessions: true, rounds: true, bets: true } },
+      },
+    });
+    if (!game) throw notFound("game not found");
+    return {
+      ok: true,
+      data: {
+        profile: {
+          id: game.id, code: game.code, name: game.name, version: game.version,
+          status: game.status, isPro: game.isPro, thumbnailUrl: game.thumbnailUrl, sortOrder: game.sortOrder,
+          providerId: game.providerId,
+          provider: game.provider,
+        },
+        configs: game.configs.map((c) => ({
+          id: c.id, gameId: c.gameId, marketId: c.marketId, market: c.market,
+          minBet: c.minBet, maxBet: c.maxBet, bettingSeconds: c.bettingSeconds,
+          timeoutSeconds: c.timeoutSeconds, stuckPolicy: c.stuckPolicy,
+        })),
+        counts: { sessions: game._count.sessions, rounds: game._count.rounds, bets: game._count.bets },
+      },
+    };
+  });
+
+  app.post("/v1/admin/games/:id/status", async (req) => {
+    const admin = await requireAdmin(req, "games.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(gameStatusChangeSchema, bodyOf(req));
+    const before = await prisma.game.findUnique({ where: { id } });
+    if (!before) throw notFound("game not found");
+    const statusMap = { activate: "active", disable: "disabled", maintenance: "maintenance" } as const;
+    const newStatus = statusMap[input.action];
+    if (before.status === newStatus) throw badRequest(`game is already ${newStatus}`);
+    const after = await prisma.game.update({ where: { id }, data: { status: newStatus } });
+    await writeAudit({
+      adminId: admin.id, req,
+      action: `game_${input.action}`,
+      entity: "game", entityId: id,
+      before: { status: before.status },
+      after: { status: after.status, reason: input.reason },
+    });
+    return { ok: true, data: { id: after.id, status: after.status } };
+  });
+
+  // --- Provider management -------------------------------------------------
+  app.get("/v1/admin/providers/summary", async (req) => {
+    await requireAdmin(req, "providers.read");
+    const [total, enabled, disabled, withErrors24h, totalGames] = await Promise.all([
+      prisma.gameProvider.count(),
+      prisma.gameProvider.count({ where: { enabled: true } }),
+      prisma.gameProvider.count({ where: { enabled: false } }),
+      prisma.apiErrorLog.count({ where: { createdAt: { gte: new Date(Date.now() - 86_400_000) }, source: "provider" } }),
+      prisma.game.count({ where: { providerId: { not: null } } }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, enabled, disabled, withErrors24h, totalGames,
+        // No separate sandbox/production environment model exists.
+        hasEnvironments: false,
+        // No dedicated health-check endpoint configured.
+        hasHealthChecks: false,
+      },
+    };
+  });
+
+  app.get("/v1/admin/providers", async (req) => {
+    await requireAdmin(req, "providers.read");
+    const q = validate(providerListQuerySchema, queryOf(req));
+    const where: Prisma.GameProviderWhereInput = {};
+    if (q.search) {
+      where.OR = [
+        { name: { contains: q.search, mode: "insensitive" } },
+        { code: { contains: q.search, mode: "insensitive" } },
+      ];
+    }
+    if (q.enabled === "true") where.enabled = true;
+    else if (q.enabled === "false") where.enabled = false;
+
+    const sortWhitelist = ["id", "name", "code", "commissionPct"];
+    const sortBy = q.sortBy && sortWhitelist.includes(q.sortBy) ? q.sortBy : "id";
+    const orderBy = { [sortBy]: q.sortDir } as const;
+
+    const [total, items] = await Promise.all([
+      prisma.gameProvider.count({ where }),
+      prisma.gameProvider.findMany({
+        where,
+        orderBy,
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: { _count: { select: { games: true } } },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        // NEVER return apiKey or apiSecret.
+        items: items.map((p) => ({
+          id: p.id,
+          name: p.name,
+          code: p.code,
+          apiBase: p.apiBase,
+          commissionPct: p.commissionPct,
+          enabled: p.enabled,
+          gameCount: p._count.games,
+          // Mask the key so admins can verify it's set without seeing the value.
+          apiKeyMasked: p.apiKey ? p.apiKey.slice(0, 4) + "…" + p.apiKey.slice(-2) : "",
+          apiSecretSet: !!p.apiSecret,
+        })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/providers/:id", async (req) => {
+    await requireAdmin(req, "providers.read");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const provider = await prisma.gameProvider.findUnique({
+      where: { id },
+      include: {
+        games: { select: { id: true, code: true, name: true, status: true, isPro: true, sortOrder: true } },
+        _count: { select: { games: true, apiKeys: true, bills: true } },
+      },
+    });
+    if (!provider) throw notFound("provider not found");
+
+    const [recentErrors, totalErrors24h] = await Promise.all([
+      prisma.apiErrorLog.findMany({
+        where: { source: "provider" },
+        orderBy: { id: "desc" },
+        take: 20,
+      }),
+      prisma.apiErrorLog.count({ where: { createdAt: { gte: new Date(Date.now() - 86_400_000) }, source: "provider" } }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        profile: {
+          id: provider.id,
+          name: provider.name,
+          code: provider.code,
+          apiBase: provider.apiBase,
+          commissionPct: provider.commissionPct,
+          enabled: provider.enabled,
+          // Secrets NEVER returned.
+          apiKeyMasked: provider.apiKey ? provider.apiKey.slice(0, 4) + "…" + provider.apiKey.slice(-2) : "",
+          apiSecretSet: !!provider.apiSecret,
+        },
+        games: provider.games.map((g) => ({
+          id: g.id, code: g.code, name: g.name, status: g.status, isPro: g.isPro, sortOrder: g.sortOrder,
+        })),
+        counts: { games: provider._count.games, apiKeys: provider._count.apiKeys, bills: provider._count.bills },
+        recentErrors: recentErrors.map((e) => ({
+          id: e.id, route: e.route, message: e.message, createdAt: e.createdAt.toISOString(),
+        })),
+        errorCount24h: totalErrors24h,
+      },
+    };
+  });
+
+  // --- Game sessions ------------------------------------------------------
+  app.get("/v1/admin/sessions", async (req) => {
+    await requireAdmin(req, "rounds.read");
+    const q = validate(sessionListQuerySchema, queryOf(req));
+    const where: Prisma.GameSessionWhereInput = {};
+    if (q.search) {
+      where.sessionKey = { contains: q.search };
+    }
+    if (q.gameId) where.gameId = q.gameId;
+    if (q.userId) where.userId = q.userId;
+    if (q.status === "open") where.closedAt = null;
+    else if (q.status === "closed") where.closedAt = { not: null };
+    if (q.providerId) where.game = { providerId: q.providerId };
+
+    const [total, items] = await Promise.all([
+      prisma.gameSession.count({ where }),
+      prisma.gameSession.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          user: { select: { id: true, displayName: true } },
+          game: { select: { id: true, code: true, name: true, providerId: true, provider: { select: { id: true, name: true } } } },
+        },
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        items: items.map((s) => ({
+          id: s.id,
+          sessionKey: s.sessionKey,
+          userId: s.userId,
+          displayName: s.user?.displayName ?? "—",
+          gameId: s.gameId,
+          gameCode: s.game?.code ?? "—",
+          gameName: s.game?.name ?? "—",
+          providerId: s.game?.providerId ?? null,
+          providerName: s.game?.provider?.name ?? null,
+          marketCode: s.marketCode,
+          status: s.closedAt ? "closed" : "open",
+          openedAt: s.openedAt.toISOString(),
+          closedAt: s.closedAt?.toISOString() ?? null,
+        })),
+      },
+    };
+  });
+
+  // --- API error logs (provider filter) -----------------------------------
+  app.get("/v1/admin/api-errors", async (req) => {
+    await requireAdmin(req, "security.read");
+    const q = validate(paginationQuery.extend({
+      source: z.string().trim().max(60).optional(),
+    }), queryOf(req));
+    const where: Prisma.ApiErrorLogWhereInput = {};
+    if (q.search) where.route = { contains: q.search };
+    if (q.source) where.source = q.source;
+    const [total, items] = await Promise.all([
+      prisma.apiErrorLog.count({ where }),
+      prisma.apiErrorLog.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total, page: q.page, pageSize: q.pageSize,
+        // Payload may contain sensitive data — never return it. Only return
+        // the safe fields: id, source, route, message, createdAt.
+        items: items.map((e) => ({
+          id: e.id,
+          source: e.source,
+          route: e.route,
+          message: e.message,
+          createdAt: e.createdAt.toISOString(),
+        })),
+      },
+    };
   });
 
   app.get("/v1/admin/reports/games", async (req) => {
