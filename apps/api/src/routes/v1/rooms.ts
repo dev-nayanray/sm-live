@@ -125,8 +125,100 @@ export async function roomRoutes(app: FastifyInstance) {
     const room = await prisma.room.findUnique({ where: { id } });
     if (!room || room.closedAt) throw notFound("room not found");
     if (room.type === "live" && room.hostId !== user.id) throw badRequest("live rooms: only host publishes");
+    // Prevent duplicate pending requests — check if the user already holds
+    // a slot OR already has a pending request.
+    const existing = await prisma.roomParticipant.findUnique({
+      where: { roomId_userId: { roomId: id, userId: user.id } },
+    });
+    if (existing?.slotIndex != null) throw badRequest("you already hold a microphone seat");
     emitToRoom(id, "slot:request", { userId: user.id, displayName: user.displayName });
     return { ok: true, data: { queued: true } };
+  });
+
+  /**
+   * Release a microphone seat (Prompt 18).
+   *
+   * A slot holder can voluntarily leave their seat at any time — the
+   * backend clears their slotIndex + role (back to audience) and emits
+   * slot:released so the UI updates for everyone. The host can also
+   * revoke a seat (same effect, different socket event for UX).
+   */
+  app.post("/v1/rooms/:id/slot-release", async (req) => {
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const { user } = await requireUser(req);
+    const room = await prisma.room.findUnique({ where: { id } });
+    if (!room || room.closedAt) throw notFound("room not found");
+    const participant = await prisma.roomParticipant.findUnique({
+      where: { roomId_userId: { roomId: id, userId: user.id } },
+    });
+    if (!participant || participant.slotIndex == null) {
+      throw badRequest("you don't hold a microphone seat");
+    }
+    // The host (slotIndex 0) cannot release their own seat — they must
+    // end the room instead. This prevents the room from becoming
+    // orphaned with no host.
+    if (participant.role === "host") throw badRequest("host cannot release their seat — end the room instead");
+    await prisma.roomParticipant.update({
+      where: { id: participant.id },
+      data: { slotIndex: null, role: "audience", muted: false },
+    });
+    emitToRoom(id, "slot:released", { roomId: id, userId: user.id, slotIndex: participant.slotIndex });
+    return { ok: true };
+  });
+
+  /**
+   * Raise hand to request a microphone seat (Prompt 18).
+   *
+   * Records the user's intent to speak. The host sees the request in
+   * their pending-requests panel and can approve (slot:approve socket
+   * event) or reject (hand:reject endpoint). Prevents duplicate
+   * pending requests.
+   */
+  app.post("/v1/rooms/:id/hand-raise", async (req) => {
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const { user } = await requireUser(req);
+    const room = await prisma.room.findUnique({ where: { id } });
+    if (!room || room.closedAt) throw notFound("room not found");
+    const participant = await prisma.roomParticipant.findUnique({
+      where: { roomId_userId: { roomId: id, userId: user.id } },
+    });
+    if (participant?.slotIndex != null) throw badRequest("you already hold a microphone seat");
+    // Check if there are free slots.
+    const takenSlots = await prisma.roomParticipant.count({
+      where: { roomId: id, slotIndex: { not: null }, leftAt: null, kickedAt: null },
+    });
+    if (takenSlots >= room.slots) throw badRequest("all microphone seats are taken — try again later");
+    emitToRoom(id, "hand:raised", { userId: user.id, displayName: user.displayName, roomId: id });
+    return { ok: true, data: { raised: true } };
+  });
+
+  /**
+   * Lower hand — cancel a pending speaker request (Prompt 18).
+   */
+  app.post("/v1/rooms/:id/hand-lower", async (req) => {
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const { user } = await requireUser(req);
+    const room = await prisma.room.findUnique({ where: { id } });
+    if (!room || room.closedAt) throw notFound("room not found");
+    emitToRoom(id, "hand:lowered", { userId: user.id, roomId: id });
+    return { ok: true, data: { lowered: true } };
+  });
+
+  /**
+   * Reject a hand-raise request (host only, Prompt 18).
+   *
+   * Notifies the requesting user that their request was declined. The
+   * host uses this when they don't want to assign a seat to the user.
+   */
+  app.post("/v1/rooms/:id/hand-reject", async (req) => {
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({ targetUserId: z.coerce.number().int().positive() }), bodyOf(req));
+    const { user } = await requireUser(req);
+    const room = await prisma.room.findUnique({ where: { id } });
+    if (!room) throw notFound("room not found");
+    if (room.hostId !== user.id) throw forbidden("only the host can reject hand-raise requests");
+    emitToRoom(id, "hand:rejected", { roomId: id, userId: input.targetUserId });
+    return { ok: true };
   });
 
   /**

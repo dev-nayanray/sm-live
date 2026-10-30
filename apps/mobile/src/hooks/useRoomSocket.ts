@@ -30,6 +30,18 @@ export interface ChatMessage {
   ts: number;
 }
 
+export interface HandRaiseRequest {
+  userId: number;
+  displayName: string;
+  roomId: number;
+}
+
+export interface SlotAssignment {
+  roomId: number;
+  userId: number;
+  slotIndex: number;
+}
+
 export interface RoomSocketState {
   connected: boolean;
   viewerCount: number;
@@ -37,8 +49,18 @@ export interface RoomSocketState {
   roomEnded: boolean;
   kicked: boolean;
   error: string | null;
+  /** Voice room: pending hand-raise requests visible to the host. */
+  handRaiseRequests: HandRaiseRequest[];
+  /** Voice room: this user's hand-raise was approved (slot assigned). */
+  slotAssigned: SlotAssignment | null;
+  /** Voice room: this user's hand-raise was rejected. */
+  handRejected: boolean;
+  /** Voice room: a seat was released. */
+  slotReleased: { userId: number; slotIndex: number } | null;
   send: (text: string) => void;
   leave: () => void;
+  /** Clear transient events (slotAssigned, handRejected, slotReleased). */
+  clearTransient: () => void;
 }
 
 export function useRoomSocket(roomId: number, userId: number | null): RoomSocketState {
@@ -48,6 +70,10 @@ export function useRoomSocket(roomId: number, userId: number | null): RoomSocket
   const [roomEnded, setRoomEnded] = useState(false);
   const [kicked, setKicked] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [handRaiseRequests, setHandRaiseRequests] = useState<HandRaiseRequest[]>([]);
+  const [slotAssigned, setSlotAssigned] = useState<SlotAssignment | null>(null);
+  const [handRejected, setHandRejected] = useState(false);
+  const [slotReleased, setSlotReleased] = useState<{ userId: number; slotIndex: number } | null>(null);
   const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
@@ -108,6 +134,52 @@ export function useRoomSocket(roomId: number, userId: number | null): RoomSocket
           ts: Date.now(),
         }]);
       });
+
+      // Voice room events (Prompt 18)
+      s.on("slot:assigned", (payload: SlotAssignment) => {
+        if (payload.roomId === roomId) {
+          setSlotAssigned(payload);
+          // Remove from pending hand-raise requests.
+          setHandRaiseRequests((prev) => prev.filter((r) => r.userId !== payload.userId));
+        }
+      });
+
+      s.on("slot:released", (payload: { roomId: number; userId: number; slotIndex: number }) => {
+        if (payload.roomId === roomId) {
+          setSlotReleased({ userId: payload.userId, slotIndex: payload.slotIndex });
+        }
+      });
+
+      s.on("hand:raised", (payload: HandRaiseRequest) => {
+        if (payload.roomId === roomId && payload.userId !== userId) {
+          setHandRaiseRequests((prev) => {
+            // Prevent duplicate requests.
+            if (prev.some((r) => r.userId === payload.userId)) return prev;
+            return [...prev, payload];
+          });
+        }
+      });
+
+      s.on("hand:lowered", (payload: { roomId: number; userId: number }) => {
+        if (payload.roomId === roomId) {
+          setHandRaiseRequests((prev) => prev.filter((r) => r.userId !== payload.userId));
+        }
+      });
+
+      s.on("hand:approved", (payload: SlotAssignment) => {
+        if (payload.roomId === roomId && payload.userId === userId) {
+          setSlotAssigned(payload);
+          setHandRaiseRequests((prev) => prev.filter((r) => r.userId !== userId));
+        }
+      });
+
+      s.on("hand:rejected", (payload: { roomId: number; userId: number }) => {
+        if (payload.roomId === roomId && payload.userId === userId) {
+          setHandRejected(true);
+        }
+        // Remove from the host's pending list regardless.
+        setHandRaiseRequests((prev) => prev.filter((r) => r.userId !== payload.userId));
+      });
     })();
 
     return () => {
@@ -135,6 +207,12 @@ export function useRoomSocket(roomId: number, userId: number | null): RoomSocket
     socketRef.current?.disconnect();
   }, [roomId]);
 
+  const clearTransient = useCallback(() => {
+    setSlotAssigned(null);
+    setHandRejected(false);
+    setSlotReleased(null);
+  }, []);
+
   return {
     connected,
     viewerCount,
@@ -142,7 +220,12 @@ export function useRoomSocket(roomId: number, userId: number | null): RoomSocket
     roomEnded,
     kicked,
     error,
+    handRaiseRequests,
+    slotAssigned,
+    handRejected,
+    slotReleased,
     send,
     leave,
+    clearTransient,
   };
 }

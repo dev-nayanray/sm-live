@@ -9,6 +9,7 @@ import {
 import {
   defaultSlotsForType, roomTypeIcon, roomTypeLabel, type RoomType,
 } from "../../src/hooks/streamPure";
+import { VOICE_ROOM_LAYOUTS } from "../../src/hooks/voiceRoomPure";
 
 /**
  * SM Live — Start Live configuration screen (Prompt 17).
@@ -38,8 +39,12 @@ export default function StartLiveScreen() {
   const { user } = useAuth();
   const [type, setType] = useState<RoomType>("live");
   const [title, setTitle] = useState("");
+  const [slotOverride, setSlotOverride] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const slots = slotOverride ?? defaultSlotsForType(type);
+  const isVoiceOrParty = type === "voice" || type === "party";
 
   const submit = async () => {
     if (busy) return;
@@ -56,13 +61,10 @@ export default function StartLiveScreen() {
         json: {
           title: trimmedTitle,
           type,
-          slots: defaultSlotsForType(type),
+          slots,
           country: "BD",
         },
       });
-      // Route to the room screen as the host. The host query param tells
-      // the room screen to render the host controls (End Live, mic toggle,
-      // camera switch, etc.).
       router.replace(`/room/${res.id}?host=1`);
     } catch (e) {
       if (e instanceof ApiError) {
@@ -90,11 +92,11 @@ export default function StartLiveScreen() {
           <Pressable
             key={rt}
             style={[s.typeCard, type === rt && s.typeCardActive]}
-            onPress={() => setType(rt)}
+            onPress={() => { setType(rt); setSlotOverride(null); }}
           >
             <Text style={s.typeIcon}>{roomTypeIcon(rt)}</Text>
             <Text style={[s.typeLabel, type === rt && s.typeLabelActive]}>{roomTypeLabel(rt)}</Text>
-            <Text style={s.typeSlots}>{defaultSlotsForType(rt)} slots</Text>
+            <Text style={s.typeSlots}>{isVoiceOrParty ? `${slots} seats` : `${defaultSlotsForType(rt)} slots`}</Text>
           </Pressable>
         ))}
       </View>
@@ -112,10 +114,31 @@ export default function StartLiveScreen() {
         />
         <View style={s.metaRow}>
           <Badge tone="muted" label={`Type: ${type}`} />
-          <Badge tone="muted" label={`Slots: ${defaultSlotsForType(type)}`} />
+          <Badge tone="muted" label={`Slots: ${slots}`} />
           <Badge tone="muted" label="Country: BD" />
         </View>
       </Card>
+
+      {/* Microphone seat capacity selector — only for voice/party rooms */}
+      {isVoiceOrParty && (
+        <>
+          <SectionHeader title="Microphone seats" icon="🎤" />
+          <View style={s.slotRow}>
+            {VOICE_ROOM_LAYOUTS.map((n) => (
+              <Pressable
+                key={n}
+                style={[s.slotCard, slots === n && s.slotCardActive]}
+                onPress={() => setSlotOverride(n)}
+              >
+                <Text style={[s.slotNum, slots === n && s.slotNumActive]}>{n}</Text>
+                <Text style={s.slotLabel}>
+                  {n === 5 ? "Small" : n === 10 ? "Medium" : n === 15 ? "Large" : "XL"}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        </>
+      )}
 
       <SectionHeader title="Before you go live" icon="⚠️" />
       <Card>
@@ -220,4 +243,34 @@ const s = StyleSheet.create({
   },
   cancelBtn: { flex: 1 },
   goLiveBtn: { flex: 2 },
+  slotRow: {
+    flexDirection: "row",
+    paddingHorizontal: spacing[4],
+    gap: spacing[2],
+  },
+  slotCard: {
+    flex: 1,
+    backgroundColor: theme.surface,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: theme.border,
+    padding: spacing[2],
+    alignItems: "center",
+    gap: spacing[1],
+  },
+  slotCardActive: {
+    borderColor: theme.primary,
+    backgroundColor: "rgba(124, 58, 237, 0.12)",
+  },
+  slotNum: {
+    ...t.h2,
+    color: theme.textMuted,
+  },
+  slotNumActive: {
+    color: theme.primaryMuted,
+  },
+  slotLabel: {
+    ...t.micro,
+    color: theme.textSubtle,
+  },
 });

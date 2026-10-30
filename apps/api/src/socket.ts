@@ -95,6 +95,26 @@ export function initSocket(httpServer: HttpServer) {
         data: { slotIndex: p.slotIndex, role: "cohost" },
       });
       io?.to(`room:${p.roomId}`).emit("slot:assigned", { roomId: p.roomId, userId: p.targetUserId, slotIndex: p.slotIndex });
+      // Also emit hand:approved so the requesting user's UI clears the
+      // pending state.
+      io?.to(`room:${p.roomId}`).emit("hand:approved", { roomId: p.roomId, userId: p.targetUserId, slotIndex: p.slotIndex });
+      ack?.({ ok: true });
+    });
+
+    // Host revokes a slot (kicks speaker from seat) — Prompt 18.
+    socket.on("slot:revoke", async (p: { roomId: number; targetUserId: number }, ack?: (r: unknown) => void) => {
+      const room = await prisma.room.findUnique({ where: { id: p.roomId } });
+      if (!room || room.hostId !== userId) return ack?.({ ok: false, error: "not host" });
+      const target = await prisma.roomParticipant.findFirst({
+        where: { roomId: p.roomId, userId: p.targetUserId, slotIndex: { not: null } },
+      });
+      if (!target) return ack?.({ ok: false, error: "user has no seat" });
+      if (target.role === "host") return ack?.({ ok: false, error: "cannot revoke host seat" });
+      await prisma.roomParticipant.update({
+        where: { id: target.id },
+        data: { slotIndex: null, role: "audience", muted: false },
+      });
+      io?.to(`room:${p.roomId}`).emit("slot:released", { roomId: p.roomId, userId: p.targetUserId, slotIndex: target.slotIndex });
       ack?.({ ok: true });
     });
 
