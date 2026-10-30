@@ -429,6 +429,16 @@ export const walletListQuerySchema = paginationQuery.extend({
 });
 export type WalletListQuery = z.infer<typeof walletListQuerySchema>;
 
+// ---------------------------------------------------------------------------
+// Reports & analytics (Prompt 08)
+// ---------------------------------------------------------------------------
+
+export const analyticsQuerySchema = z.object({
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+export type AnalyticsQuery = z.infer<typeof analyticsQuerySchema>;
+
 // --- Public app config (response of GET /v1/config/app) ---
 export interface AppConfigGift { id: number; name: string; iconUrl: string; price: number; category: string; animation: string; }
 export interface AppConfigGame { code: string; name: string; thumbnailUrl: string; isPro: boolean; status: string; minBet: number; maxBet: number; }

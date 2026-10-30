@@ -21,6 +21,7 @@ import { RoundsBets } from "./pages/RoundsBets";
 import { Wallet } from "./pages/Wallet";
 import { Players } from "./pages/Players";
 import { Reports } from "./pages/Reports";
+import { Analytics } from "./pages/Analytics";
 import { ProvidersSettlement } from "./pages/ProvidersSettlement";
 import { Security } from "./pages/Security";
 import { Settings } from "./pages/Settings";
@@ -72,7 +73,8 @@ function Shell() {
         <Route path="/rounds" element={<RequirePerm perm="rounds.read"><RoundsBets /></RequirePerm>} />
         <Route path="/wallet" element={<RequirePerm perm="wallet.read"><Wallet /></RequirePerm>} />
         <Route path="/players" element={<RequirePerm perm="players.read"><Players /></RequirePerm>} />
-        <Route path="/reports" element={<RequirePerm perm="reports.read"><Reports /></RequirePerm>} />
+        <Route path="/reports" element={<RequirePerm perm="reports.read"><Analytics /></RequirePerm>} />
+        <Route path="/reports/revenue" element={<RequirePerm perm="reports.read"><Reports /></RequirePerm>} />
         <Route path="/providers" element={<RequirePerm perm="providers.read"><ProvidersSettlement /></RequirePerm>} />
         <Route path="/security" element={<RequirePerm perm="security.read"><Security /></RequirePerm>} />
         <Route path="/settings" element={<RequirePerm perm="settings.read"><Settings /></RequirePerm>} />

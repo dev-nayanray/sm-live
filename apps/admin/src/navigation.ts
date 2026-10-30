@@ -235,7 +235,7 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "Platform Analytics",
         perm: "reports.read",
         icon: "chart",
-        hint: "Game performance + revenue charts (existing page).",
+        hint: "Overview, user growth, live, games, financial, provider, and system analytics.",
       },
       {
         to: null,

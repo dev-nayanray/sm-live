@@ -8,7 +8,7 @@ import {
   agencyCreateSchema, agencyUpdateSchema, agencyStatusChangeSchema, agencyListQuerySchema,
   roomReportCreateSchema, roomReportUpdateSchema, roomListQuerySchema,
   gameStatusChangeSchema, gameListQuerySchema, providerListQuerySchema, sessionListQuerySchema,
-  ledgerListQuerySchema, walletListQuerySchema,
+  ledgerListQuerySchema, walletListQuerySchema, analyticsQuerySchema,
 } from "@sm-live/shared";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
@@ -3008,6 +3008,502 @@ export async function adminRoutes(app: FastifyInstance) {
     await requireAdmin(req, "reports.read");
     const rows = await prisma.dailyRevenue.findMany({ orderBy: { day: "desc" }, take: 90 });
     return { ok: true, data: rows };
+  });
+
+  // --- Analytics module (Prompt 08) --------------------------------------
+  //
+  // Centralized analytics endpoints that aggregate real data from existing
+  // models. All endpoints use `reports.read` permission and accept date
+  // range filters (from/to as YYYY-MM-DD, UTC half-open [from, to)).
+  //
+  // Design principles:
+  //   - Every metric comes from a real Prisma aggregate query.
+  //   - No fabricated data, no mock metrics, no invented calculations.
+  //   - Transaction volume ≠ revenue ≠ profit (clearly labelled).
+  //   - Server status comes from process.* — no fabricated CPU/disk metrics.
+  //   - CSV export has formula-injection sanitization + 5000-row cap.
+
+  /** Helper: resolve a date range from the analytics query params. */
+  function resolveAnalyticsRange(q: { from?: string; to?: string }): { from: Date | undefined; to: Date | undefined } {
+    let from: Date | undefined;
+    let to: Date | undefined;
+    if (q.from) from = new Date(`${q.from}T00:00:00.000Z`);
+    if (q.to) {
+      const t = new Date(`${q.to}T00:00:00.000Z`);
+      t.setUTCDate(t.getUTCDate() + 1);
+      to = t;
+    }
+    return { from, to };
+  }
+
+  /** Helper: build a Prisma DateTimeFilter from the range. */
+  function dateFilter(from?: Date, to?: Date): Prisma.DateTimeFilter | undefined {
+    if (!from && !to) return undefined;
+    const f: Prisma.DateTimeFilter = {};
+    if (from) f.gte = from;
+    if (to) f.lt = to;
+    return f;
+  }
+
+  app.get("/v1/admin/analytics/overview", async (req) => {
+    await requireAdmin(req, "reports.read");
+    const q = validate(analyticsQuerySchema, queryOf(req));
+    const { from, to } = resolveAnalyticsRange(q);
+    const df = dateFilter(from, to);
+
+    const [
+      totalUsers, newUsers, totalAgencies, activeAgencies,
+      activeRooms, totalRooms,
+      activeSessions, totalSessions,
+      totalBets, wonBets, lostBets,
+      totalRecharges, succeededRecharges, failedRecharges,
+      totalLedgerEntries, creditEntries, debitEntries,
+      totalPayouts, totalRefunds,
+      openRoomReports, totalRoomReports,
+      activeGames, maintenanceGames, disabledGames,
+      totalProviders, enabledProviders,
+    ] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: df ? { createdAt: df } : {} }),
+      prisma.agency.count(),
+      prisma.agency.count({ where: { active: true } }),
+      prisma.room.count({ where: { closedAt: null } }),
+      prisma.room.count(),
+      prisma.gameSession.count({ where: { closedAt: null } }),
+      prisma.gameSession.count(df ? { where: { openedAt: df } } : undefined),
+      prisma.bet.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.bet.count({ where: { ...(df ? { createdAt: df } : undefined), status: "won" } }),
+      prisma.bet.count({ where: { ...(df ? { createdAt: df } : undefined), status: "lost" } }),
+      prisma.recharge.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.recharge.count({ where: { ...(df ? { createdAt: df } : undefined), status: "succeeded" } }),
+      prisma.recharge.count({ where: { ...(df ? { createdAt: df } : undefined), status: "failed" } }),
+      prisma.ledgerEntry.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.ledgerEntry.count({ where: { ...(df ? { createdAt: df } : undefined), amount: { gt: 0 } } }),
+      prisma.ledgerEntry.count({ where: { ...(df ? { createdAt: df } : undefined), amount: { lt: 0 } } }),
+      prisma.payout.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.refund.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.roomReport.count({ where: { status: { in: ["open", "in_review"] } } }),
+      prisma.roomReport.count(),
+      prisma.game.count({ where: { status: "active" } }),
+      prisma.game.count({ where: { status: "maintenance" } }),
+      prisma.game.count({ where: { status: "disabled" } }),
+      prisma.gameProvider.count(),
+      prisma.gameProvider.count({ where: { enabled: true } }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        users: { total: totalUsers, new: newUsers },
+        agencies: { total: totalAgencies, active: activeAgencies },
+        rooms: { total: totalRooms, active: activeRooms },
+        sessions: { total: totalSessions, active: activeSessions },
+        bets: { total: totalBets, won: wonBets, lost: lostBets },
+        recharges: { total: totalRecharges, succeeded: succeededRecharges, failed: failedRecharges },
+        ledger: { total: totalLedgerEntries, credits: creditEntries, debits: debitEntries },
+        payouts: { total: totalPayouts },
+        refunds: { total: totalRefunds },
+        reports: { total: totalRoomReports, open: openRoomReports },
+        games: { active: activeGames, maintenance: maintenanceGames, disabled: disabledGames },
+        providers: { total: totalProviders, enabled: enabledProviders },
+        // DAU/WAU/MAU not available — no daily active-user tracking table exists.
+        hasActiveUserTracking: false,
+        note: "All metrics are derived from real database records. DAU/WAU/MAU not available — no daily active-user tracking table exists.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/analytics/financial", async (req) => {
+    await requireAdmin(req, "reports.read");
+    const q = validate(analyticsQuerySchema, queryOf(req));
+    const { from, to } = resolveAnalyticsRange(q);
+    const df = dateFilter(from, to);
+
+    const [
+      rechargeVolume, betDebitVolume, winCreditVolume,
+      giftDebitVolume, giftCreditVolume, refundVolume,
+      adminAdjustVolume, agencyCommissionVolume,
+      pendingRecharges, failedRecharges,
+      pendingWithdrawals, approvedWithdrawals,
+    ] = await Promise.all([
+      prisma.ledgerEntry.aggregate({ where: { ...(df ? { createdAt: df } : undefined), kind: "recharge" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...(df ? { createdAt: df } : undefined), kind: "bet_debit" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...(df ? { createdAt: df } : undefined), kind: "win_credit" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...(df ? { createdAt: df } : undefined), kind: "gift_debit" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...(df ? { createdAt: df } : undefined), kind: "gift_credit" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...(df ? { createdAt: df } : undefined), kind: "refund" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...(df ? { createdAt: df } : undefined), kind: "admin_adjust" }, _sum: { amount: true } }),
+      prisma.ledgerEntry.aggregate({ where: { ...(df ? { createdAt: df } : undefined), kind: "agency_commission" }, _sum: { amount: true } }),
+      prisma.recharge.count({ where: { status: "pending" } }),
+      prisma.recharge.count({ where: { status: "failed" } }),
+      prisma.agencyWithdrawal.count({ where: { status: "pending" } }),
+      prisma.agencyWithdrawal.count({ where: { status: "approved" } }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        currency: "coins",
+        rechargeVolume: rechargeVolume._sum.amount ?? 0,
+        betDebitVolume: Math.abs(betDebitVolume._sum.amount ?? 0),
+        winCreditVolume: winCreditVolume._sum.amount ?? 0,
+        giftDebitVolume: Math.abs(giftDebitVolume._sum.amount ?? 0),
+        giftCreditVolume: giftCreditVolume._sum.amount ?? 0,
+        refundVolume: Math.abs(refundVolume._sum.amount ?? 0),
+        adminAdjustVolume: adminAdjustVolume._sum.amount ?? 0,
+        agencyCommissionVolume: agencyCommissionVolume._sum.amount ?? 0,
+        pendingRecharges, failedRecharges,
+        pendingWithdrawals, approvedWithdrawals,
+        netGamingMargin: Math.abs(betDebitVolume._sum.amount ?? 0) - (winCreditVolume._sum.amount ?? 0),
+        note: "Net gaming margin = bet debits - win credits. NOT platform profit. Commission is settled separately via ProviderBill.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/analytics/users", async (req) => {
+    await requireAdmin(req, "reports.read");
+    const q = validate(analyticsQuerySchema, queryOf(req));
+    const { from, to } = resolveAnalyticsRange(q);
+
+    // Daily registration series.
+    const series = await prisma.$queryRaw<{ day: Date; count: bigint }[]>`
+      SELECT d::date AS day, COUNT(u.id) AS count
+      FROM generate_series(
+        ${from ? from.toISOString() : new Date(Date.now() - 30 * 86_400_000).toISOString()}::timestamptz,
+        ${to ? to.toISOString() : new Date().toISOString()}::timestamptz,
+        INTERVAL '1 day'
+      ) d
+      LEFT JOIN "User" u ON u."createdAt"::date = d::date
+      GROUP BY d ORDER BY d`;
+
+    // Country distribution.
+    const countryDist = await prisma.$queryRaw<{ country: string; count: bigint }[]>`
+      SELECT country, COUNT(*) as count FROM "User" GROUP BY country ORDER BY count DESC LIMIT 20`;
+
+    // Account status distribution (from PlayerRestriction).
+    const [banned, muted, frozen, totalUsers] = await Promise.all([
+      prisma.playerRestriction.count({ where: { type: "ban", OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] } }),
+      prisma.playerRestriction.count({ where: { type: "mute", OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] } }),
+      prisma.playerRestriction.count({ where: { type: "freeze_wallet", OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] } }),
+      prisma.user.count(),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        registrationSeries: series.map((s) => ({ day: new Date(s.day).toISOString().slice(0, 10), count: Number(s.count) })),
+        countryDistribution: countryDist.map((c) => ({ country: c.country, count: Number(c.count) })),
+        statusDistribution: {
+          total: totalUsers,
+          active: Math.max(0, totalUsers - banned - muted - frozen),
+          banned, muted, frozen,
+        },
+        hasRetentionData: false,
+        note: "Registration series uses real User.createdAt. Retention/cohort analysis not available — no daily login tracking table exists.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/analytics/live", async (req) => {
+    await requireAdmin(req, "reports.read");
+    const q = validate(analyticsQuerySchema, queryOf(req));
+    const { from, to } = resolveAnalyticsRange(q);
+
+    const df = dateFilter(from, to);
+
+    const [
+      totalRooms, activeRooms, closedRooms,
+      liveRooms, voiceRooms, partyRooms,
+      totalParticipants, totalRoomReports,
+      roomSeries,
+    ] = await Promise.all([
+      prisma.room.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.room.count({ where: { closedAt: null } }),
+      prisma.room.count({ where: { closedAt: { not: null } } }),
+      prisma.room.count({ where: { type: "live", ...(df ? { createdAt: df } : undefined) } }),
+      prisma.room.count({ where: { type: "voice", ...(df ? { createdAt: df } : undefined) } }),
+      prisma.room.count({ where: { type: "party", ...(df ? { createdAt: df } : undefined) } }),
+      prisma.roomParticipant.count(df ? { where: { joinedAt: df } } : undefined),
+      prisma.roomReport.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.$queryRaw<{ day: Date; count: bigint }[]>`
+        SELECT d::date AS day, COUNT(r.id) AS count
+        FROM generate_series(
+          ${from ? from.toISOString() : new Date(Date.now() - 30 * 86_400_000).toISOString()}::timestamptz,
+          ${to ? to.toISOString() : new Date().toISOString()}::timestamptz,
+          INTERVAL '1 day'
+        ) d
+        LEFT JOIN "Room" r ON r."createdAt"::date = d::date
+        GROUP BY d ORDER BY d`,
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        totalRooms, activeRooms, closedRooms,
+        byType: { live: liveRooms, voice: voiceRooms, party: partyRooms },
+        totalParticipants, totalRoomReports,
+        roomCreationSeries: roomSeries.map((s) => ({ day: new Date(s.day).toISOString().slice(0, 10), count: Number(s.count) })),
+        // Average room duration not available — no room-endedAt tracking on
+        // closed rooms in a way that's reliably populated.
+        hasDurationData: false,
+        note: "Room counts are real. Average room duration not available — closedAt is not consistently populated.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/analytics/games", async (req) => {
+    await requireAdmin(req, "reports.read");
+    const q = validate(analyticsQuerySchema, queryOf(req));
+    const { from, to } = resolveAnalyticsRange(q);
+    const df = dateFilter(from, to);
+
+    const [
+      totalGames, activeGames, maintenanceGames,
+      totalSessions, activeSessions,
+      totalBets, placedBets, wonBets, lostBets,
+      totalBetVolume, totalPayoutVolume,
+      sessionSeries,
+    ] = await Promise.all([
+      prisma.game.count(),
+      prisma.game.count({ where: { status: "active" } }),
+      prisma.game.count({ where: { status: "maintenance" } }),
+      prisma.gameSession.count(df ? { where: { openedAt: df } } : undefined),
+      prisma.gameSession.count({ where: { closedAt: null } }),
+      prisma.bet.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.bet.count({ where: { ...(df ? { createdAt: df } : undefined), status: "placed" } }),
+      prisma.bet.count({ where: { ...(df ? { createdAt: df } : undefined), status: "won" } }),
+      prisma.bet.count({ where: { ...(df ? { createdAt: df } : undefined), status: "lost" } }),
+      prisma.bet.aggregate({ where: df ? { createdAt: df } : undefined, _sum: { amount: true } }),
+      prisma.payout.aggregate({ where: df ? { createdAt: df } : undefined, _sum: { amount: true } }),
+      prisma.$queryRaw<{ day: Date; count: bigint }[]>`
+        SELECT d::date AS day, COUNT(gs.id) AS count
+        FROM generate_series(
+          ${from ? from.toISOString() : new Date(Date.now() - 30 * 86_400_000).toISOString()}::timestamptz,
+          ${to ? to.toISOString() : new Date().toISOString()}::timestamptz,
+          INTERVAL '1 day'
+        ) d
+        LEFT JOIN "GameSession" gs ON gs."openedAt"::date = d::date
+        GROUP BY d ORDER BY d`,
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        totalGames, activeGames, maintenanceGames,
+        totalSessions, activeSessions,
+        totalBets, placedBets, wonBets, lostBets,
+        totalBetVolume: totalBetVolume._sum.amount ?? 0,
+        totalPayoutVolume: totalPayoutVolume._sum.amount ?? 0,
+        netGamingMargin: (totalBetVolume._sum.amount ?? 0) - (totalPayoutVolume._sum.amount ?? 0),
+        sessionSeries: sessionSeries.map((s) => ({ day: new Date(s.day).toISOString().slice(0, 10), count: Number(s.count) })),
+        note: "Net gaming margin = bet volume - payout volume. NOT platform profit.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/analytics/providers", async (req) => {
+    await requireAdmin(req, "reports.read");
+    const q = validate(analyticsQuerySchema, queryOf(req));
+    const { from, to } = resolveAnalyticsRange(q);
+    const df = dateFilter(from, to);
+
+    const [
+      totalProviders, enabledProviders, disabledProviders,
+      totalApiErrors, providerErrors,
+    ] = await Promise.all([
+      prisma.gameProvider.count(),
+      prisma.gameProvider.count({ where: { enabled: true } }),
+      prisma.gameProvider.count({ where: { enabled: false } }),
+      prisma.apiErrorLog.count(df ? { where: { createdAt: df } } : undefined),
+      prisma.apiErrorLog.count({ where: { ...(df ? { createdAt: df } : undefined), source: "provider" } }),
+    ]);
+
+    // Per-provider game count + error count.
+    const providers = await prisma.gameProvider.findMany({
+      select: {
+        id: true, name: true, code: true, enabled: true,
+        _count: { select: { games: true } },
+      },
+    });
+
+    return {
+      ok: true,
+      data: {
+        totalProviders, enabledProviders, disabledProviders,
+        totalApiErrors, providerErrors,
+        providers: providers.map((p) => ({
+          id: p.id, name: p.name, code: p.code, enabled: p.enabled,
+          gameCount: p._count.games,
+        })),
+        hasResponseTimeData: false,
+        note: "Provider error counts are from ApiErrorLog. No API response-time tracking — not instrumented.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/analytics/system", async (req) => {
+    await requireAdmin(req, "security.read");
+    const mem = process.memoryUsage();
+    const cpuUsage = process.cpuUsage();
+    return {
+      ok: true,
+      data: {
+        uptimeSeconds: Math.floor(process.uptime()),
+        nodeVersion: process.version,
+        platform: `${os.platform()} ${os.arch()}`,
+        memory: {
+          rssMb: Math.round(mem.rss / 1024 / 1024),
+          heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+          heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
+          externalMb: Math.round(mem.external / 1024 / 1024),
+        },
+        cpu: {
+          userMicros: cpuUsage.user,
+          systemMicros: cpuUsage.system,
+        },
+        pid: process.pid,
+        time: new Date().toISOString(),
+        // No external monitoring integration (Prometheus, Datadog, etc.)
+        hasExternalMonitoring: false,
+        hasDatabaseMetrics: false,
+        hasCacheMetrics: false,
+        note: "System metrics from process.* — real Node.js runtime data. No external monitoring (Prometheus/Datadog) integration. Database/cache metrics not instrumented.",
+      },
+    };
+  });
+
+  app.get("/v1/admin/analytics/errors", async (req) => {
+    await requireAdmin(req, "security.read");
+    const q = validate(analyticsQuerySchema.extend({
+      source: z.string().trim().max(60).optional(),
+    }), queryOf(req));
+    const { from, to } = resolveAnalyticsRange(q);
+    const df = dateFilter(from, to);
+
+    const where: Prisma.ApiErrorLogWhereInput = {};
+    if (df) where.createdAt = df;
+    if (q.source) where.source = q.source;
+
+    const [total, bySource] = await Promise.all([
+      prisma.apiErrorLog.count({ where }),
+      prisma.apiErrorLog.groupBy({
+        by: ["source"],
+        where,
+        _count: true,
+        orderBy: { _count: { source: "desc" } },
+      }),
+    ]);
+
+    return {
+      ok: true,
+      data: {
+        total,
+        bySource: bySource.map((s) => ({ source: s.source, count: s._count })),
+      },
+    };
+  });
+
+  app.get("/v1/admin/analytics/export", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (req, reply) => {
+    await requireAdmin(req, "reports.read");
+    const q = validate(analyticsQuerySchema.extend({
+      category: z.enum(["users", "rooms", "sessions", "bets", "recharges", "ledger"]),
+    }), queryOf(req));
+    const { from, to } = resolveAnalyticsRange(q);
+    const df = dateFilter(from, to);
+
+    const headers: string[] = [];
+    const rows: Record<string, unknown>[] = [];
+
+    if (q.category === "users") {
+      headers.push("id", "displayName", "country", "marketCode", "vipLevel", "createdAt");
+      const items = await prisma.user.findMany({
+        where: df ? { createdAt: df } : {},
+        orderBy: { id: "asc" },
+        take: 5000,
+        select: { id: true, displayName: true, country: true, marketCode: true, vipLevel: true, createdAt: true },
+      });
+      items.forEach((u) => rows.push({
+        id: u.id, displayName: u.displayName, country: u.country, marketCode: u.marketCode,
+        vipLevel: u.vipLevel, createdAt: u.createdAt.toISOString(),
+      }));
+    } else if (q.category === "rooms") {
+      headers.push("id", "title", "type", "country", "status", "createdAt", "closedAt");
+      const items = await prisma.room.findMany({
+        where: df ? { createdAt: df } : {},
+        orderBy: { id: "asc" },
+        take: 5000,
+        select: { id: true, title: true, type: true, country: true, closedAt: true, createdAt: true },
+      });
+      items.forEach((r) => rows.push({
+        id: r.id, title: r.title, type: r.type, country: r.country,
+        status: r.closedAt ? "closed" : "active",
+        createdAt: r.createdAt.toISOString(), closedAt: r.closedAt?.toISOString() ?? "",
+      }));
+    } else if (q.category === "sessions") {
+      headers.push("id", "sessionKey", "userId", "gameId", "marketCode", "openedAt", "closedAt");
+      const items = await prisma.gameSession.findMany({
+        where: df ? { openedAt: df } : {},
+        orderBy: { id: "asc" },
+        take: 5000,
+      });
+      items.forEach((s) => rows.push({
+        id: s.id, sessionKey: s.sessionKey, userId: s.userId, gameId: s.gameId,
+        marketCode: s.marketCode, openedAt: s.openedAt.toISOString(),
+        closedAt: s.closedAt?.toISOString() ?? "",
+      }));
+    } else if (q.category === "bets") {
+      headers.push("id", "userId", "amount", "status", "payout", "providerTxId", "createdAt", "settledAt");
+      const items = await prisma.bet.findMany({
+        where: df ? { createdAt: df } : {},
+        orderBy: { id: "asc" },
+        take: 5000,
+      });
+      items.forEach((b) => rows.push({
+        id: b.id, userId: b.userId, amount: b.amount, status: b.status, payout: b.payout,
+        providerTxId: b.providerTxId, createdAt: b.createdAt.toISOString(),
+        settledAt: b.settledAt?.toISOString() ?? "",
+      }));
+    } else if (q.category === "recharges") {
+      headers.push("id", "userId", "amount", "provider", "status", "externalId", "createdAt");
+      const items = await prisma.recharge.findMany({
+        where: df ? { createdAt: df } : {},
+        orderBy: { id: "asc" },
+        take: 5000,
+      });
+      items.forEach((r) => rows.push({
+        id: r.id, userId: r.userId, amount: r.amount, provider: r.provider,
+        status: r.status, externalId: r.externalId, createdAt: r.createdAt.toISOString(),
+      }));
+    } else if (q.category === "ledger") {
+      headers.push("id", "userId", "kind", "amount", "balanceAfter", "txKey", "createdAt");
+      const items = await prisma.ledgerEntry.findMany({
+        where: df ? { createdAt: df } : {},
+        orderBy: { id: "asc" },
+        take: 5000,
+      });
+      items.forEach((e) => rows.push({
+        id: e.id.toString(), userId: e.userId, kind: e.kind, amount: e.amount,
+        balanceAfter: e.balanceAfter, txKey: e.txKey, createdAt: e.createdAt.toISOString(),
+      }));
+    }
+
+    const escape = (v: unknown): string => {
+      let s = v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+      if (/[",\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+
+    const lines = [
+      headers.join(","),
+      ...rows.map((r) => headers.map((h) => escape(r[h])).join(",")),
+    ];
+    const csv = lines.join("\n");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    reply.header("content-type", "text/csv; charset=utf-8");
+    reply.header("content-disposition", `attachment; filename="${q.category}-${stamp}.csv"`);
+    reply.header("x-export-row-count", String(rows.length));
+    return csv;
   });
 
   // --- Providers & settlement -------------------------------------------------
