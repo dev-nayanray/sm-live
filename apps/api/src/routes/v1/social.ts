@@ -5,6 +5,7 @@ import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { validate, bodyOf, paramsOf, queryOf } from "../../lib/validate.js";
 import { requireUser } from "../../lib/auth.js";
 import { recordSecurityEvent } from "../../lib/audit.js";
+import { createNotification } from "./notifications.js";
 
 /**
  * SM Live — Social Connections API (Prompt 16).
@@ -123,6 +124,16 @@ export async function socialRoutes(app: FastifyInstance) {
     try {
       await prisma.follow.create({
         data: { followerId: user.id, followingId: userId },
+      });
+      // Create a notification for the followed user.
+      const follower = await prisma.user.findUnique({ where: { id: user.id }, select: { displayName: true } });
+      await createNotification({
+        userId: userId,
+        category: "follow",
+        title: "New follower",
+        body: `${follower?.displayName ?? "Someone"} started following you.`,
+        link: `/profile/${user.id}`,
+        meta: { followerId: user.id },
       });
     } catch (e) {
       // P2002 = unique constraint violation → already following (idempotent).

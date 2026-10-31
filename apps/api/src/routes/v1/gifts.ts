@@ -8,6 +8,7 @@ import { validate, bodyOf, queryOf } from "../../lib/validate.js";
 import { requireUser } from "../../lib/auth.js";
 import { postLedgerEntries, type LedgerEntryInput } from "../../services/ledger.service.js";
 import { emitToRoom } from "../../socket.js";
+import { createNotification } from "./notifications.js";
 
 /**
  * Gift send: single atomic ledger batch —
@@ -90,6 +91,16 @@ export async function giftRoutes(app: FastifyInstance) {
         to: { id: recipient.id, displayName: recipient.displayName },
       });
     }
+
+    // Create a notification for the gift recipient.
+    await createNotification({
+      userId: recipient.id,
+      category: "gift",
+      title: "You received a gift!",
+      body: `${sender.displayName} sent you ${input.quantity}× ${gift.name} (${totalPrice} coins).`,
+      link: input.roomId ? `/room/${input.roomId}` : `/profile/${sender.id}`,
+      meta: { giftTransactionId: giftTx.id, giftName: gift.name, senderId: sender.id, totalPrice },
+    });
 
     return {
       ok: true,

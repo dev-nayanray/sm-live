@@ -6,6 +6,7 @@ import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { validate, bodyOf, paramsOf, queryOf } from "../../lib/validate.js";
 import { requireUser } from "../../lib/auth.js";
 import { emitToRoom } from "../../socket.js";
+import { createNotification } from "./notifications.js";
 
 /**
  * SM Live — Direct Messaging API (Prompt 19).
@@ -328,6 +329,22 @@ export async function messageRoutes(app: FastifyInstance) {
         sender: message.sender,
       },
     });
+
+    // Create notifications for all OTHER participants in the conversation.
+    const otherParticipants = await prisma.conversationParticipant.findMany({
+      where: { conversationId: id, userId: { not: user.id }, leftAt: null },
+      select: { userId: true },
+    });
+    for (const p of otherParticipants) {
+      await createNotification({
+        userId: p.userId,
+        category: "dm",
+        title: `New message from ${user.displayName}`,
+        body: input.body.slice(0, 80) + (input.body.length > 80 ? "…" : ""),
+        link: `/chat/${id}`,
+        meta: { conversationId: id, senderId: user.id },
+      });
+    }
 
     return { ok: true, data: { id: message.id, conversationId: id } };
   });

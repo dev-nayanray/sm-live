@@ -8,6 +8,7 @@ import { feedRoutes } from "../src/routes/v1/feed.js";
 import { messageRoutes } from "../src/routes/v1/messages.js";
 import { socialRoutes } from "../src/routes/v1/social.js";
 import { vipRoutes } from "../src/routes/v1/vip.js";
+import { notificationRoutes } from "../src/routes/v1/notifications.js";
 import { setErrorHandler } from "../src/lib/errors.js";
 
 export async function buildTestApp(): Promise<FastifyInstance> {
@@ -30,6 +31,7 @@ export async function buildTestApp(): Promise<FastifyInstance> {
   await app.register(messageRoutes);
   await app.register(socialRoutes);
   await app.register(vipRoutes);
+  await app.register(notificationRoutes);
   await app.ready();
   return app;
 }

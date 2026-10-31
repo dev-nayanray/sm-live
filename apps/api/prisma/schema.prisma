@@ -55,6 +55,7 @@ model User {
   reportsMade    UserReport[]     @relation("ReportReporter")
   reportsAgainst UserReport[]     @relation("ReportReported")
   vipMemberships VipMembership[]
+  notifications  AppNotification[]
 
   @@index([agencyId])
   @@index([marketCode])
@@ -1268,4 +1269,32 @@ model VipMembership {
 
   @@index([userId])
   @@index([status, expiresAt])
+}
+
+// ===========================================================================
+// Notifications (Prompt 23)
+// ===========================================================================
+
+/**
+ * AppNotification — a notification delivered to a user. `category` is
+ * one of: social | follow | gift | dm | live | voice | game | wallet |
+ * vip | system | support. `link` is an optional deep-link path (e.g.
+ * "/profile/42" or "/wallet"). `readAt` is null for unread. `meta` is
+ * optional structured data (e.g. giftId, senderId).
+ */
+model AppNotification {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  category  String    @default("system")
+  title     String
+  body      String    @default("")
+  link      String    @default("")
+  readAt    DateTime?
+  meta      Json?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
 }

@@ -73,6 +73,8 @@ function ThemedStack() {
         <Stack.Screen name="rankings" options={{ title: "Rankings", headerShown: false }} />
         <Stack.Screen name="game/[code]/details" options={{ title: "Game Details", headerShown: false }} />
         <Stack.Screen name="game/history" options={{ title: "Game History", headerShown: false }} />
+        <Stack.Screen name="notifications" options={{ title: "Notifications", headerShown: false }} />
+        <Stack.Screen name="support/[ticketId]" options={{ title: "Ticket", headerShown: false }} />
         <Stack.Screen name="live/start" options={{ title: "Start Live", headerShown: false }} />
       </Stack>
     </>

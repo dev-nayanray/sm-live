@@ -1,174 +1,114 @@
 import { router } from "expo-router";
-import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useState } from "react";
-import { Button, Card, Input, SectionHeader, theme, t, spacing } from "../../src/components";
+import { api, ApiError } from "../../src/api/client";
+import { Button, Input, theme, t, spacing, radius } from "../../src/components";
+import { TICKET_CATEGORIES } from "../../src/hooks/notificationPure";
 
-/**
- * SM Live — Open a new support ticket (Prompt 13).
- *
- * The backend (Prompt 11) accepts POST /v1/admin/support/tickets from
- * admins; the user-facing POST /v1/support/tickets route is NOT yet
- * exposed. Rather than fake a working submission, this screen captures
- * the user's report into local state and explains what happens next.
- *
- * When the user-facing route lands, wire the submit handler to
- * `api("/v1/support/tickets", { method: "POST", json: { ... } })` and
- * route to the ticket detail page on success.
- */
-const CATEGORIES = [
-  { key: "account_issues", label: "Account issues", icon: "👤" },
-  { key: "payment", label: "Wallet / coins", icon: "🪙" },
-  { key: "harassment", label: "Report harassment", icon: "🚨" },
-  { key: "bug", label: "Bug report", icon: "🐛" },
-  { key: "feature_request", label: "Feature request", icon: "💡" },
-  { key: "other", label: "Other", icon: "📝" },
-] as const;
-
-export default function NewTicket() {
+export default function NewTicketScreen() {
+  const [category, setCategory] = useState("other");
   const [subject, setSubject] = useState("");
   const [description, setDescription] = useState("");
-  const [category, setCategory] = useState<(typeof CATEGORIES)[number]["key"]>("account_issues");
-  const [submitted, setSubmitted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<{ id: number } | null>(null);
+
+  const submit = async () => {
+    if (submitting) return;
+    if (subject.trim().length < 3) { setError("Subject must be at least 3 characters"); return; }
+    if (description.trim().length < 1) { setError("Description is required"); return; }
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await api<{ id: number }>("/v1/support/tickets", {
+        method: "POST",
+        json: { subject: subject.trim(), description: description.trim(), category },
+      });
+      setDone({ id: res.id });
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Failed to submit ticket");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (done) {
+    return (
+      <View style={s.center}>
+        <Text style={s.doneIcon}>✓</Text>
+        <Text style={s.doneTitle}>Ticket Created!</Text>
+        <Text style={s.doneBody}>Your ticket #{done.id} has been submitted. Our support team will review it shortly.</Text>
+        <View style={s.doneActions}>
+          <Button label="View Ticket" onPress={() => router.replace(`/support/${done.id}`)} style={{ flex: 1 }} />
+          <Button variant="ghost" label="Back to Support" onPress={() => router.replace("/support")} style={{ flex: 1 }} />
+        </View>
+      </View>
+    );
+  }
 
   return (
-    <ScrollView style={s.root} contentContainerStyle={{ paddingBottom: spacing[6] }}>
-      <Text style={s.title}>Open a ticket</Text>
+    <ScrollView style={s.root} contentContainerStyle={{ padding: spacing[4], gap: spacing[3] }}>
+      <Text style={s.title}>Create Support Ticket</Text>
 
-      {submitted ? (
-        <Card>
-          <SectionHeader title="Captured" icon="✅" />
-          <Text style={s.body}>
-            Your report has been captured. Once the user-facing ticket submission endpoint
-            is live, it will be filed automatically. For now, please copy the details
-            below and paste them into the live lobby to reach support.
-          </Text>
-          <View style={s.summary}>
-            <Text style={s.summaryLabel}>Subject</Text>
-            <Text style={s.summaryValue}>{subject}</Text>
-            <Text style={s.summaryLabel}>Category</Text>
-            <Text style={s.summaryValue}>{category}</Text>
-            <Text style={s.summaryLabel}>Description</Text>
-            <Text style={s.summaryValue}>{description}</Text>
-          </View>
-          <Button label="Open lobby chat" icon="💬" onPress={() => router.push("/chat/lobby")} />
-        </Card>
-      ) : (
-        <>
-          <Card>
-            <SectionHeader title="Category" icon="🏷️" />
-            <View style={s.catRow}>
-              {CATEGORIES.map((c) => (
-                <Pressable
-                  key={c.key}
-                  style={({ pressed }) => [s.cat, category === c.key && s.catActive, pressed && { opacity: 0.7 }]}
-                  onPress={() => setCategory(c.key)}
-                >
-                  <Text style={s.catIcon}>{c.icon}</Text>
-                  <Text style={[s.catLabel, category === c.key && s.catLabelActive]}>{c.label}</Text>
-                </Pressable>
-              ))}
-            </View>
-          </Card>
+      <Text style={s.label}>Category</Text>
+      <View style={s.categoryWrap}>
+        {TICKET_CATEGORIES.map((c) => (
+          <Pressable
+            key={c.key}
+            style={[s.categoryChip, category === c.key && s.categoryChipActive]}
+            onPress={() => setCategory(c.key)}
+          >
+            <Text style={s.categoryIcon}>{c.icon}</Text>
+            <Text style={[s.categoryText, category === c.key && s.categoryTextActive]}>{c.label}</Text>
+          </Pressable>
+        ))}
+      </View>
 
-          <Card>
-            <SectionHeader title="Details" icon="📝" />
-            <Input
-              label="Subject"
-              value={subject}
-              onChangeText={setSubject}
-              placeholder="Short summary of the issue"
-              maxLength={120}
-            />
-            <Text style={s.fieldLabel}>Description</Text>
-            <TextInput
-              style={s.textArea}
-              value={description}
-              onChangeText={setDescription}
-              placeholder="Describe what happened, what you expected, and what you saw instead."
-              placeholderTextColor={theme.textSubtle}
-              multiline
-              numberOfLines={6}
-              maxLength={2000}
-              textAlignVertical="top"
-            />
-            <Text style={s.counter}>{description.length}/2000</Text>
-          </Card>
+      <Input
+        label="Subject"
+        value={subject}
+        onChangeText={(v) => { setSubject(v); if (error) setError(null); }}
+        placeholder="Brief summary of the issue"
+        maxLength={120}
+      />
 
-          <View style={s.actionRow}>
-            <Button variant="ghost" label="Cancel" onPress={() => router.back()} />
-            <Button
-              label="Submit"
-              icon="📤"
-              disabled={!subject.trim() || !description.trim()}
-              onPress={() => setSubmitted(true)}
-            />
-          </View>
-        </>
-      )}
+      <Text style={s.label}>Description</Text>
+      <Input
+        value={description}
+        onChangeText={(v) => { setDescription(v); if (error) setError(null); }}
+        placeholder="Describe your issue in detail…"
+        multiline
+        numberOfLines={5}
+        maxLength={4000}
+        style={{ minHeight: 120, textAlignVertical: "top" }}
+      />
+
+      {error && <View style={s.errorBox}><Text style={s.errorText}>{error}</Text></View>}
+
+      <View style={s.actions}>
+        <Button variant="ghost" label="Cancel" onPress={() => router.back()} style={{ flex: 1 }} />
+        <Button label="Submit" onPress={submit} loading={submitting} disabled={submitting} style={{ flex: 1 }} />
+      </View>
     </ScrollView>
   );
 }
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: theme.bg },
-  title: { ...t.h1, color: theme.text, paddingHorizontal: spacing[4], paddingTop: spacing[4], paddingBottom: spacing[2] },
-  body: { ...t.body, color: theme.textMuted, lineHeight: 22 },
-  catRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: spacing[2],
-  },
-  cat: {
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[2],
-    borderRadius: 999,
-    backgroundColor: theme.surfaceAlt,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing[1],
-  },
-  catActive: {
-    backgroundColor: theme.primary,
-  },
-  catIcon: { fontSize: 16 },
-  catLabel: { ...t.caption, color: theme.textMuted, fontWeight: "600" },
-  catLabelActive: { color: theme.textInverse },
-  fieldLabel: {
-    ...t.caption,
-    color: theme.textSubtle,
-    marginTop: spacing[3],
-    marginBottom: spacing[1],
-  },
-  textArea: {
-    minHeight: 120,
-    backgroundColor: theme.surfaceAlt,
-    color: theme.text,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: theme.border,
-    padding: spacing[3],
-    ...t.body,
-  },
-  counter: {
-    ...t.micro,
-    color: theme.textSubtle,
-    textAlign: "right",
-    marginTop: spacing[1],
-  },
-  summary: {
-    backgroundColor: theme.surfaceAlt,
-    borderRadius: 12,
-    padding: spacing[3],
-    marginVertical: spacing[3],
-    gap: spacing[1],
-  },
-  summaryLabel: { ...t.caption, color: theme.textSubtle, fontWeight: "600" },
-  summaryValue: { ...t.body, color: theme.text },
-  actionRow: {
-    flexDirection: "row",
-    gap: spacing[2],
-    paddingHorizontal: spacing[4],
-    marginTop: spacing[4],
-    justifyContent: "flex-end",
-  },
+  center: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: theme.bg, padding: spacing[5], gap: spacing[2] },
+  doneIcon: { fontSize: 48, color: "#34d399" },
+  doneTitle: { ...t.h1, color: "#34d399" },
+  doneBody: { ...t.body, color: "#94a3b8", textAlign: "center", lineHeight: 22 },
+  doneActions: { flexDirection: "row", gap: spacing[2], marginTop: spacing[4] },
+  title: { ...t.h1, color: theme.text },
+  label: { ...t.caption, color: theme.textSubtle, fontWeight: "600" },
+  categoryWrap: { flexDirection: "row", flexWrap: "wrap", gap: spacing[2] },
+  categoryChip: { flexDirection: "row", alignItems: "center", gap: spacing[1], backgroundColor: theme.surface, borderRadius: radius.pill, borderWidth: 1, borderColor: theme.border, paddingHorizontal: spacing[2], paddingVertical: spacing[1] },
+  categoryChipActive: { borderColor: theme.primary, backgroundColor: "rgba(124,58,237,0.12)" },
+  categoryIcon: { fontSize: 14 },
+  categoryText: { ...t.micro, color: theme.textMuted, fontWeight: "600" },
+  categoryTextActive: { color: theme.primaryMuted },
+  errorBox: { backgroundColor: "rgba(251,113,133,0.12)", borderLeftWidth: 3, borderLeftColor: theme.danger, paddingHorizontal: spacing[3], paddingVertical: spacing[2], borderRadius: radius.md },
+  errorText: { ...t.caption, color: theme.danger },
+  actions: { flexDirection: "row", gap: spacing[2], marginTop: spacing[2] },
 });
