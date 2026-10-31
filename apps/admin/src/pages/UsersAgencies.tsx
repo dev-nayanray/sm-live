@@ -174,10 +174,10 @@ function UsersTab() {
   // Agencies (for the filter dropdown)
   const agenciesQ = useQuery({
     queryKey: ["agencies-flat"],
-    queryFn: () => api<AgencyNode[]>("/v1/admin/agencies"),
+    queryFn: () => api<{ items: AgencyNode[] }>("/v1/admin/agencies?pageSize=100"),
     staleTime: 5 * 60_000,
   });
-  const agencies = (agenciesQ.data ?? []).map((a) => ({ id: a.id, name: a.name }));
+  const agencies = (agenciesQ.data?.items ?? []).map((a) => ({ id: a.id, name: a.name }));
 
   // Build the query string for the list endpoint.
   const listQs = (() => {
@@ -456,11 +456,11 @@ function WalletModal({ user, onClose, onDone }: { user: UserRow; onClose: () => 
 // --------------------------------------------------------------------------
 function AgenciesTab() {
   const { can } = useAuth();
-  const { data, isLoading, refetch } = useQuery({ queryKey: ["agencies"], queryFn: () => api<AgencyNode[]>("/v1/admin/agencies") });
+  const { data, isLoading, refetch } = useQuery({ queryKey: ["agencies"], queryFn: () => api<{ items: AgencyNode[] }>("/v1/admin/agencies?pageSize=100") });
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ name: "", code: "", commissionRate: "0.1", parentId: "" });
   if (isLoading) return <Loading />;
-  const nodes = data ?? [];
+  const nodes = data?.items ?? [];
   if (nodes.length === 0) return <Empty text="no agencies" />;
 
   return (

@@ -81,6 +81,8 @@ services:
     build:
       context: ..
       dockerfile: apps/admin/Dockerfile
+      args:
+        VITE_API_BASE: http://localhost:4001
     depends_on:
       - api
     environment:

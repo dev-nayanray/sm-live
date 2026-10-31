@@ -1,0 +1,13 @@
+.git
+node_modules
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+**/.expo
+**/coverage
+*.log
+.env
+.env.local
+infra/backups
+apps/api/admin_token.json
+docs

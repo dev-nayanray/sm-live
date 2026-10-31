@@ -87,15 +87,17 @@ function Boot() {
     const t = setTimeout(() => setBooted(true), 400);
     return () => clearTimeout(t);
   }, []);
-  if (!booted) {
-    return (
-      <View style={styles.splash}>
-        <Text style={styles.splashTitle}>SM LIVE</Text>
-        <Text style={styles.splashSub}>loading…</Text>
-      </View>
-    );
-  }
-  return <ThemedStack />;
+  return (
+    <>
+      <ThemedStack />
+      {!booted && (
+        <View style={styles.splashOverlay}>
+          <Text style={styles.splashTitle}>SM LIVE</Text>
+          <Text style={styles.splashSub}>loading…</Text>
+        </View>
+      )}
+    </>
+  );
 }
 
 interface ErrorBoundaryState { hasError: boolean; error: Error | null }
@@ -139,6 +141,10 @@ export default function RootLayout() {
 
 const styles = StyleSheet.create({
   splash: { flex: 1, backgroundColor: theme.bg, alignItems: "center", justifyContent: "center" },
+  // The navigator must stay mounted from the first frame; the splash renders
+  // on top of it. Unmounting the Stack during boot makes early router.replace
+  // calls throw "Attempted to navigate before mounting the Root Layout".
+  splashOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: theme.bg, alignItems: "center", justifyContent: "center" },
   splashTitle: { ...t.display, color: theme.primaryMuted, letterSpacing: 4 },
   splashSub: { ...t.caption, color: theme.textSubtle, marginTop: spacing[2] },
   errWrap: { flex: 1, backgroundColor: theme.bg, alignItems: "center", justifyContent: "center", padding: spacing[5], gap: spacing[2] },

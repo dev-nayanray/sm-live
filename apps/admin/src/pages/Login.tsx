@@ -36,7 +36,7 @@ export function Login() {
           <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
         </label>
         {error && <div className="text-rose-500 text-sm mb-3">{error}</div>}
-        <Button disabled={busy || !password}>{busy ? "Signing in…" : "Sign in"}</Button>
+        <Button type="submit" disabled={busy || !password}>{busy ? "Signing in…" : "Sign in"}</Button>
         <p className="text-xs text-slate-400 mt-4">seeded: superadmin / SuperAdmin123! · viewer / Viewer123! (read-only)</p>
       </form>
     </div>
