@@ -221,25 +221,9 @@ export async function feedRoutes(app: FastifyInstance) {
     };
   });
 
-  /**
-   * Notifications count. The platform does NOT yet have a notification
-   * backend — this endpoint always returns 0 and documents the
-   * integration boundary. When a notification provider lands, replace
-   * the body with a real query against the (future) Notification table.
-   */
-  app.get("/v1/notifications/count", async (req) => {
-    await requireUser(req);
-    return {
-      ok: true,
-      data: {
-        unread: 0,
-        total: 0,
-        // Documented so the mobile client can show an honest empty state
-        // rather than a fake badge.
-        supported: false,
-      },
-    };
-  });
+  // The real GET /v1/notifications/count lives in routes/v1/notifications.ts
+  // (Prompt 23) — the old always-zero stub that used to sit here was removed
+  // because Fastify fatally rejects duplicated route registrations.
 }
 
 /**
