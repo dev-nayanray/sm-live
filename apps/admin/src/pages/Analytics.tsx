@@ -106,7 +106,7 @@ function OverviewTab({ qs }: { qs: string }) {
   );
 }
 
-function UsersTab({ qs }: { qs: string }) {
+export function UsersTab({ qs }: { qs: string }) {
   const { data, isLoading } = useQuery({
     queryKey: ["analytics-users", qs],
     queryFn: () => api<{
@@ -220,7 +220,7 @@ function LiveTab({ qs }: { qs: string }) {
   );
 }
 
-function GamesTab({ qs }: { qs: string }) {
+export function GamesTab({ qs }: { qs: string }) {
   const { data, isLoading } = useQuery({
     queryKey: ["analytics-games", qs],
     queryFn: () => api<{
@@ -273,7 +273,7 @@ function GamesTab({ qs }: { qs: string }) {
   );
 }
 
-function FinancialTab({ qs }: { qs: string }) {
+export function FinancialTab({ qs }: { qs: string }) {
   const { data, isLoading } = useQuery({
     queryKey: ["analytics-financial", qs],
     queryFn: () => api<{

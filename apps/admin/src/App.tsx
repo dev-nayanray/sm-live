@@ -26,6 +26,17 @@ import { ProvidersSettlement } from "./pages/ProvidersSettlement";
 import { Security } from "./pages/Security";
 import { Settings } from "./pages/Settings";
 import { Operations } from "./pages/Operations";
+import { AccountRestrictions } from "./pages/AccountRestrictions";
+import { ComplaintsSupport } from "./pages/ComplaintsSupport";
+import { ContentModeration } from "./pages/ContentModeration";
+import { GiftsItems } from "./pages/GiftsItems";
+import { AvailabilityMaintenance } from "./pages/AvailabilityMaintenance";
+import { RefundRecords } from "./pages/RefundRecords";
+import { PayoutConfig } from "./pages/PayoutConfig";
+import { UserActivityReports, GamePerformance, FinancialReports } from "./pages/ReportPages";
+import { ApiIntegration, WebhookMonitoring, ApiErrorLogs, SandboxStatus } from "./pages/ProviderPages";
+import { Administrators, RolesPermissions, AuditLogs, SecurityEvents, IpAccess } from "./pages/SecurityPages";
+import { NotificationCenter, PlatformStatus, MaintenanceConfig } from "./pages/SystemPages";
 import { AccessDenied } from "./pages/AccessDenied";
 import { NotFound } from "./pages/NotFound";
 import "./index.css";
@@ -80,6 +91,30 @@ function Shell() {
         <Route path="/security" element={<RequirePerm perm="security.read"><Security /></RequirePerm>} />
         <Route path="/settings" element={<RequirePerm perm="settings.read"><Settings /></RequirePerm>} />
         <Route path="/operations" element={<RequirePerm perm="ops.view"><Operations /></RequirePerm>} />
+
+        {/* Dedicated consoles (formerly "planned" nav items) */}
+        <Route path="/account-restrictions" element={<RequirePerm perm="players.read"><AccountRestrictions /></RequirePerm>} />
+        <Route path="/complaints-support" element={<RequirePerm perm="users.read"><ComplaintsSupport /></RequirePerm>} />
+        <Route path="/content-moderation" element={<RequirePerm perm="rooms.read"><ContentModeration /></RequirePerm>} />
+        <Route path="/gifts" element={<RequirePerm perm="rooms.read"><GiftsItems /></RequirePerm>} />
+        <Route path="/availability" element={<RequirePerm perm="games.read"><AvailabilityMaintenance /></RequirePerm>} />
+        <Route path="/refunds" element={<RequirePerm perm="wallet.read"><RefundRecords /></RequirePerm>} />
+        <Route path="/payout-config" element={<RequirePerm perm="games.read"><PayoutConfig /></RequirePerm>} />
+        <Route path="/financial-reports" element={<RequirePerm perm="reports.read"><FinancialReports /></RequirePerm>} />
+        <Route path="/user-activity" element={<RequirePerm perm="reports.read"><UserActivityReports /></RequirePerm>} />
+        <Route path="/game-performance" element={<RequirePerm perm="reports.read"><GamePerformance /></RequirePerm>} />
+        <Route path="/api-integration" element={<RequirePerm perm="providers.read"><ApiIntegration /></RequirePerm>} />
+        <Route path="/webhooks" element={<RequirePerm perm="providers.read"><WebhookMonitoring /></RequirePerm>} />
+        <Route path="/api-errors" element={<RequirePerm perm="security.read"><ApiErrorLogs /></RequirePerm>} />
+        <Route path="/sandbox-status" element={<RequirePerm perm="providers.read"><SandboxStatus /></RequirePerm>} />
+        <Route path="/administrators" element={<RequirePerm perm="security.read"><Administrators /></RequirePerm>} />
+        <Route path="/roles" element={<RequirePerm perm="security.read"><RolesPermissions /></RequirePerm>} />
+        <Route path="/audit-logs" element={<RequirePerm perm="security.read"><AuditLogs /></RequirePerm>} />
+        <Route path="/security-events" element={<RequirePerm perm="security.read"><SecurityEvents /></RequirePerm>} />
+        <Route path="/ip-access" element={<RequirePerm perm="security.read"><IpAccess /></RequirePerm>} />
+        <Route path="/notifications" element={<RequirePerm perm="settings.read"><NotificationCenter /></RequirePerm>} />
+        <Route path="/platform-status" element={<RequirePerm perm="ops.view"><PlatformStatus /></RequirePerm>} />
+        <Route path="/maintenance-config" element={<RequirePerm perm="ops.view"><MaintenanceConfig /></RequirePerm>} />
 
         {/* Unknown admin URLs: a clean not-found state instead of silent redirect. */}
         <Route path="*" element={<NotFound key={location.pathname} />} />

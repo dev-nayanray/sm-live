@@ -2601,6 +2601,137 @@ export async function adminRoutes(app: FastifyInstance) {
     return { ok: true, data: { user, restrictions, sessions, bets, complaints, suspicious } };
   });
 
+
+  // --- Room reports (content moderation queue) -----------------------------
+  app.get("/v1/admin/room-reports", async (req) => {
+    await requireAdmin(req, "rooms.read");
+    const q = validate(paginationQuery.extend({
+      status: z.string().trim().max(20).optional(),
+      category: z.string().trim().max(40).optional(),
+    }), queryOf(req));
+    const where: Prisma.RoomReportWhereInput = {};
+    if (q.status) where.status = q.status;
+    if (q.category) where.category = q.category;
+    if (q.search) where.description = { contains: q.search };
+    const [total, open, items] = await Promise.all([
+      prisma.roomReport.count({ where }),
+      prisma.roomReport.count({ where: { status: "open" } }),
+      prisma.roomReport.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: {
+          room: { select: { id: true, title: true, type: true } },
+        },
+      }),
+    ]);
+    return { ok: true, data: { total, open, page: q.page, pageSize: q.pageSize, items } };
+  });
+
+  app.patch("/v1/admin/room-reports/:id", async (req) => {
+    const admin = await requireAdmin(req, "rooms.write");
+    const { id } = validate(z.object({ id: z.coerce.number() }), paramsOf(req));
+    const input = validate(z.object({
+      status: z.enum(["open", "in_review", "resolved", "dismissed"]).optional(),
+      reviewNote: z.string().max(500).optional(),
+    }), bodyOf(req));
+    const before = await prisma.roomReport.findUnique({ where: { id } });
+    if (!before) throw notFound();
+    const after = await prisma.roomReport.update({
+      where: { id },
+      data: { ...input, reviewerId: admin.id },
+    });
+    await writeAudit({ adminId: admin.id, req, action: "review_room_report", entity: "roomReport", entityId: id, before, after });
+    return { ok: true, data: after };
+  });
+
+  // --- Security events feed -------------------------------------------------
+  app.get("/v1/admin/security-events", async (req) => {
+    await requireAdmin(req, "security.read");
+    const q = validate(paginationQuery.extend({
+      kind: z.string().trim().max(60).optional(),
+    }), queryOf(req));
+    const where: Prisma.SecurityEventWhereInput = {};
+    if (q.kind) where.kind = { contains: q.kind };
+    if (q.search) where.message = { contains: q.search };
+    const [total, items, last24h] = await Promise.all([
+      prisma.securityEvent.count({ where }),
+      prisma.securityEvent.findMany({
+        where,
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+      }),
+      prisma.securityEvent.count({ where: { createdAt: { gte: new Date(Date.now() - 24 * 3600 * 1000) } } }),
+    ]);
+    return { ok: true, data: { total, last24h, page: q.page, pageSize: q.pageSize, items } };
+  });
+
+  // --- Notification centre (broadcasts) --------------------------------------
+  app.get("/v1/admin/notifications", async (req) => {
+    await requireAdmin(req, "settings.read");
+    const q = validate(paginationQuery, queryOf(req));
+    const [total, items, sent24h, readCount] = await Promise.all([
+      prisma.appNotification.count(),
+      prisma.appNotification.findMany({
+        orderBy: { id: "desc" },
+        skip: (q.page - 1) * q.pageSize,
+        take: q.pageSize,
+        include: { user: { select: { id: true, displayName: true } } },
+      }),
+      prisma.appNotification.count({ where: { createdAt: { gte: new Date(Date.now() - 24 * 3600 * 1000) } } }),
+      prisma.appNotification.count({ where: { readAt: { not: null } } }),
+    ]);
+    return {
+      ok: true,
+      data: {
+        total,
+        sent24h,
+        readCount,
+        items: items.map(({ user, ...n }) => ({ ...n, userName: user?.displayName ?? null })),
+      },
+    };
+  });
+
+  app.post("/v1/admin/notifications", async (req) => {
+    const admin = await requireAdmin(req, "settings.write");
+    const input = validate(z.object({
+      userIds: z.array(z.coerce.number().int().positive()).min(1).max(5000).optional(),
+      vipOnly: z.boolean().optional(),
+      category: z.enum(["system", "promo", "wallet", "social", "moderation"]).default("system"),
+      title: z.string().trim().min(1).max(120),
+      body: z.string().trim().max(1000).default(""),
+      link: z.string().trim().max(200).default(""),
+    }), bodyOf(req));
+    const where: Prisma.UserWhereInput = input.userIds
+      ? { id: { in: input.userIds } }
+      : input.vipOnly
+        ? { vipLevel: { gt: 0 } }
+        : {};
+    const users = await prisma.user.findMany({ where, select: { id: true } });
+    if (users.length === 0) throw badRequest("no recipients matched");
+    const result = await prisma.appNotification.createMany({
+      data: users.map((u) => ({
+        userId: u.id,
+        category: input.category,
+        title: input.title,
+        body: input.body,
+        link: input.link,
+      })),
+    });
+    await writeAudit({
+      adminId: admin.id,
+      req,
+      action: "broadcast_notification",
+      entity: "appNotification",
+      entityId: 0,
+      before: null,
+      after: { recipients: result.count, title: input.title, category: input.category },
+    });
+    return { ok: true, data: { sent: result.count } };
+  });
+
   app.get("/v1/admin/complaints", async (req) => {
     await requireAdmin(req, "players.read");
     const q = validate(paginationQuery, queryOf(req));
